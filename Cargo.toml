@@ -1,5 +1,5 @@
 [package]
-name = "canvas-cli"
+name = "canvas-downloader"
 version = "0.1.0"
 edition = "2021"
 
