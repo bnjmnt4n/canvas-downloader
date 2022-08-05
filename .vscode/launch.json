@@ -1,0 +1,23 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug executable 'canvas-cli'",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=canvas-cli",
+                    "--package=canvas-cli"
+                ],
+                "filter": {
+                    "name": "canvas-cli",
+                    "kind": "bin"
+                }
+            },
+            "args": ["-c", "a", "-d", "abc", "-s"],
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}
