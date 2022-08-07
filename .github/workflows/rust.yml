@@ -1,0 +1,79 @@
+name: Rust
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # a list of all the targets
+        include:
+          - TARGET: x86_64-unknown-linux-gnu
+            OS: ubuntu-latest
+          - TARGET: x86_64-unknown-linux-musl
+            OS: ubuntu-latest
+          - TARGET: aarch64-apple-darwin
+            OS: macos-latest
+          - TARGET: x86_64-apple-darwin
+            OS: macos-latest
+          - TARGET: x86_64-pc-windows-gnu
+            OS: windows-latest
+    runs-on: ${{ matrix.OS }}
+    env:
+      NAME: rust-cross-compile-example
+      TARGET: ${{ matrix.TARGET }}
+      OS: ${{ matrix.OS }}
+    steps:
+      - uses: actions/checkout@v2
+      - name: Cargo cache
+        uses: actions/cache@v2
+        with:
+          path: |
+            ~/.cargo/registry
+            ./target
+          key: build-cargo-registry-${{matrix.TARGET}}
+      - name: List
+        run: find ./
+      - name: Install and configure dependencies
+        run: |
+          # dependencies are only needed on ubuntu as that's the only place where
+          # we make cross-compilation
+          if [[ $OS =~ ^ubuntu.*$ ]]; then
+            sudo apt-get install -qq crossbuild-essential-arm64 crossbuild-essential-armhf
+          fi
+      - name: Install rust target
+        run: rustup target add $TARGET
+      - name: Run build
+        run: cargo build --release --verbose --target $TARGET
+      - name: List target
+        run: find ./target
+      - name: Move to artifacts folder
+        run: |
+          mkdir -p ./artifacts
+          # windows is the only OS using a different convention for executable file name
+          if [[ $OS =~ ^windows.*$ ]]; then
+              EXEC=$NAME.exe
+          else
+              EXEC=$NAME
+          fi
+          if [[ $GITHUB_REF_TYPE =~ ^tag$ ]]; then
+            TAG=$GITHUB_REF_NAME
+          else
+            TAG=$GITHUB_SHA
+          fi
+          mv ./target/$TARGET/release/$EXEC ./$EXEC
+      - name: Archive artifact
+        uses: actions/upload-artifact@v2
+        with:
+          name: result
+          path: |
+            ./artifacts
