@@ -59,15 +59,17 @@ jobs:
           # windows is the only OS using a different convention for executable file name
           if [[ $OS =~ ^windows.*$ ]]; then
               EXEC=$NAME.exe
+              NEW_NAME=$NAME-$TARGET-$TAG.exe
           else
               EXEC=$NAME
+              NEW_NAME=$NAME-$TARGET-$TAG
           fi
           if [[ $GITHUB_REF_TYPE =~ ^tag$ ]]; then
             TAG=$GITHUB_REF_NAME
           else
             TAG=$GITHUB_SHA
           fi
-          mv ./target/$TARGET/release/$EXEC ./artifacts/$EXEC-$TARGET-$TAG
+          mv ./target/$TARGET/release/$EXEC ./artifacts/$NEW_NAME
       - name: Archive artifact
         uses: actions/upload-artifact@v2
         with:
