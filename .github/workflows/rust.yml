@@ -29,7 +29,7 @@ jobs:
             OS: windows-latest
     runs-on: ${{ matrix.OS }}
     env:
-      NAME: rust-cross-compile-example
+      NAME: canvas-downloader
       TARGET: ${{ matrix.TARGET }}
       OS: ${{ matrix.OS }}
     steps:
@@ -54,8 +54,6 @@ jobs:
         run: rustup target add $TARGET
       - name: Run build
         run: cargo build --release --verbose --target $TARGET
-      - name: List target
-        run: find ./target
       - name: Move to artifacts folder
         run: |
           mkdir -p ./artifacts
