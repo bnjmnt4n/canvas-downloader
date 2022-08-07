@@ -161,7 +161,7 @@ async fn main() -> Result<()> {
                         .progress_chars("=>-")
                 );
 
-                let message = format!("Downloading {} to {}", canvas_file.filename, canvas_file.filepath.to_string_lossy());
+                let message = format!("{}", canvas_file.filename);
 
                 progress_bar.set_message(message);
 
@@ -187,6 +187,10 @@ async fn main() -> Result<()> {
 
     for handle in join_handles {
         handle.await?;
+    }
+
+    for canvas_file in Arc::try_unwrap(files_to_download).unwrap() {
+        println!("Downloaded {} to {}", canvas_file.filename, canvas_file.filepath.to_string_lossy());
     }
 
     Ok(())
