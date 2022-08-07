@@ -4,7 +4,7 @@ use clap::Parser;
 use futures::{future::BoxFuture, FutureExt};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::header;
-use std::{sync::Arc, path::PathBuf};
+use std::{sync::{Arc, atomic::{AtomicUsize, Ordering}}, path::PathBuf};
 use tokio::sync::Mutex;
 
 #[tokio::main]
@@ -120,22 +120,21 @@ async fn main() -> Result<()> {
     println!("Downloading {} file{}", files_to_download.len(), if files_to_download.len() == 1 { "" } else { "s" } );
 
     let mut join_handles = Vec::new();
-    let mut start = 0;
+    let atomic_file_index = Arc::new(AtomicUsize::new(0));
     for i in 0..num_worker_threads {
         let mut work = min_work;
         if i < num_worker_extra_work {
             work += 1;
         }
-        let work_start = start;
-        let work_end = work_start + work;
-        start = work_end;
         let canvas_token = canvas_token.clone();
         let client = client.clone();
         let files_to_download = files_to_download.clone();
         let progress_bars = progress_bars.clone();
+        let atomic_file_index = atomic_file_index.clone();
         let handle = tokio::spawn(async move {
-            for i in work_start..work_end {
-                let canvas_file = files_to_download.get(i).unwrap();
+            for _ in 0..work {
+                let file_index = atomic_file_index.fetch_add(1, Ordering::Relaxed);
+                let canvas_file = files_to_download.get(file_index).unwrap();
 
                 // We need to determine the file size before we download, so we can create a ProgressBar
                 // A Header request for the CONTENT_LENGTH header gets us the file size
