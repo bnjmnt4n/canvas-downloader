@@ -35,16 +35,16 @@ async fn main() -> Result<()> {
         Option::None
     };
 
-    let canvas_url = if credentials.is_some() {
-        credentials.clone().unwrap().canvas_url
-    } else {
+    let canvas_url = if args.canvas_url.is_some() {
         args.canvas_url.unwrap()
+    } else {
+        credentials.clone().unwrap().canvas_url
     };
 
-    let canvas_token = if credentials.is_some() {
-        credentials.clone().unwrap().canvas_token
-    } else {
+    let canvas_token = if args.canvas_token.is_some() {
         args.canvas_token.unwrap()
+    } else {
+        credentials.clone().unwrap().canvas_token
     };
 
     if args.save_credentials {
@@ -70,7 +70,7 @@ async fn main() -> Result<()> {
         .send()
         .await
         .with_context(|| format!("Something went wrong when reaching {}", &courses_link))?
-        .json::<Vec<canvas::Course>>()
+        .json::<Vec<Option<canvas::Course>>>()
         .await?;
 
     let options = ProcessOptions {
@@ -83,22 +83,27 @@ async fn main() -> Result<()> {
 
     println!("Courses found:");
     for course in courses {
-        println!("  * {} - {}", course.course_code, course.name);
+        match course {
+            Some(course) => {
+                println!("  * {} - {}", course.course_code, course.name);
 
-        let course_folder_path = args.destination_folder.join(course.course_code);
-        if !course_folder_path.exists() {
-            std::fs::create_dir(&course_folder_path)
-                .with_context(|| format!("Failed to create directory: {}", course_folder_path.to_string_lossy()))?;
+                let course_folder_path = args.destination_folder.join(course.course_code);
+                if !course_folder_path.exists() {
+                    std::fs::create_dir(&course_folder_path)
+                        .with_context(|| format!("Failed to create directory: {}", course_folder_path.to_string_lossy()))?;
+                }
+
+                // this api gives us the root folder
+                let course_folders_link = format!("{}/{}/folders/by_path/", &courses_link, course.id);
+
+                let mut new_options = options.clone();
+                new_options.link = course_folders_link;
+                new_options.parent_folder_path = course_folder_path;
+
+                process_folders(new_options).await;
+            },
+            _ => (),
         }
-
-        // this api gives us the root folder
-        let course_folders_link = format!("{}/{}/folders/by_path/", &courses_link, course.id);
-
-        let mut new_options = options.clone();
-        new_options.link = course_folders_link;
-        new_options.parent_folder_path = course_folder_path;
-
-        process_folders(new_options).await;
     }
 
     println!("");
@@ -159,57 +164,77 @@ async fn main() -> Result<()> {
 fn process_folders(options: ProcessOptions) -> BoxFuture<'static, ()> {
     async move {
         let canvas_token = &options.canvas_token;
-        let folders = options.client.get(&options.link)
+        let folders_result = options.client.get(&options.link)
             .bearer_auth(&canvas_token)
             .send()
             .await
             .with_context(|| format!("Something went wrong when reaching {}", &options.link)).unwrap()
             .json::<Vec<canvas::Folder>>()
-            .await.unwrap();
+            .await;
+        
+        match folders_result {
+            Ok(folders) => {
+                for folder in folders {
+                    // println!("  * {} - {}", folder.id, folder.name);
+                    let sanitized_folder_name = sanitize_filename::sanitize(folder.name);
+                    // if the folder has no parent, it is the root folder of a course
+                    // so we avoid the extra directory nesting by not appending the root folder name
+                    let folder_path = if folder.parent_folder_id.is_some() {
+                        options.parent_folder_path.clone().join(sanitized_folder_name)
+                    } else {
+                        options.parent_folder_path.clone()
+                    };
+                    if !folder_path.exists() {
+                        std::fs::create_dir(&folder_path)
+                            .with_context(|| format!("Failed to create directory: {}", folder_path.to_string_lossy())).unwrap();
+                    }
 
-        for folder in folders {
-            // println!("  * {} - {}", folder.id, folder.name);
-            let sanitized_folder_name = sanitize_filename::sanitize(folder.name);
-            let folder_path = options.parent_folder_path.join(sanitized_folder_name);
-            if !folder_path.exists() {
-                std::fs::create_dir(&folder_path)
-                    .with_context(|| format!("Failed to create directory: {}", folder_path.to_string_lossy())).unwrap();
+                    let mut new_options = options.clone();
+                    new_options.link = folder.files_url.clone();
+                    new_options.parent_folder_path = folder_path.clone();
+                    process_files(new_options).await;
+        
+                    let mut new_options = options.clone();
+                    new_options.link = folder.folders_url.clone();
+                    new_options.parent_folder_path = folder_path.clone();
+                    process_folders(new_options).await;
+                }
+            },
+            Err(e) => {
+                println!("Failed to deserialize folders at link:{}, path:{}\n{}", &options.link, &options.parent_folder_path.to_string_lossy(), e.to_string());
             }
-
-            let mut new_options = options.clone();
-            new_options.link = folder.files_url.clone();
-            new_options.parent_folder_path = folder_path.clone();
-            process_files(new_options).await;
-
-            let mut new_options = options.clone();
-            new_options.link = folder.folders_url.clone();
-            new_options.parent_folder_path = folder_path.clone();
-            process_folders(new_options).await;
         }
     }.boxed()
 }
 
 async fn process_files(options: ProcessOptions) {
-    let mut files = options.client.get(&options.link)
+    let files_result = options.client.get(&options.link)
         .bearer_auth(&options.canvas_token)
         .send()
         .await
         .with_context(|| format!("Something went wrong when reaching {}", &options.link)).unwrap()
         .json::<Vec<canvas::File>>()
-        .await.unwrap();
-
-    for file in &mut files {
-        let sanitized_filename = sanitize_filename::sanitize(&file.filename);
-        file.filepath = options.parent_folder_path.join(sanitized_filename);
-    }
-
-    // only download files that do not exist and match their parent folder id
-    let mut filtered_files = files.into_iter()
-        .filter(|f| !f.filepath.exists())
-        .collect::<Vec<canvas::File>>();
-
-    let mut lock = options.files_to_download.lock().await;
-    lock.append(&mut filtered_files);
+        .await;
+    
+    match files_result {
+        Ok(mut files) => {
+            for file in &mut files {
+                let sanitized_filename = sanitize_filename::sanitize(&file.filename);
+                file.filepath = options.parent_folder_path.join(sanitized_filename);
+            }
+            
+            // only download files that do not exist and match their parent folder id
+            let mut filtered_files = files.into_iter()
+            .filter(|f| !f.filepath.exists())
+            .collect::<Vec<canvas::File>>();
+            
+            let mut lock = options.files_to_download.lock().await;
+            lock.append(&mut filtered_files);
+        },
+        Err(e) => {
+            println!("Failed to deserialize files at link:{}, path:{}\n{}", &options.link, &options.parent_folder_path.to_string_lossy(), e.to_string());
+        }
+    };
 }
 
 #[derive(Parser)]
@@ -253,6 +278,7 @@ mod canvas {
         pub files_url: String,
         pub for_submissions: bool,
         pub can_upload: bool,
+        pub parent_folder_id: Option<u32>,
     }
     
     #[derive(Clone, Debug, Deserialize)]
