@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use canvas::ProcessOptions;
 use clap::Parser;
 use futures::{future::BoxFuture, FutureExt};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use reqwest::header;
 use std::{sync::Arc, path::PathBuf};
 use tokio::sync::Mutex;
 
@@ -113,6 +115,7 @@ async fn main() -> Result<()> {
     let files_to_download = Arc::new(Arc::try_unwrap(options.files_to_download).unwrap().into_inner());
     let num_worker_extra_work = files_to_download.len() % num_worker_threads;
     let min_work = files_to_download.len() / num_worker_threads;
+    let progress_bars = Arc::new(MultiProgress::new());
 
     println!("Downloading {} file{}", files_to_download.len(), if files_to_download.len() == 1 { "" } else { "s" } );
 
@@ -126,27 +129,56 @@ async fn main() -> Result<()> {
         let work_start = start;
         let work_end = work_start + work;
         start = work_end;
-        let files_to_download = files_to_download.clone();
         let canvas_token = canvas_token.clone();
         let client = client.clone();
+        let files_to_download = files_to_download.clone();
+        let progress_bars = progress_bars.clone();
         let handle = tokio::spawn(async move {
             for i in work_start..work_end {
-                let file = files_to_download.get(i).unwrap();
-                println!("Downloading {} to {}", file.filename, file.filepath.to_string_lossy());
+                let canvas_file = files_to_download.get(i).unwrap();
 
-                let file_bytes = client.get(&file.url)
+                // We need to determine the file size before we download, so we can create a ProgressBar
+                // A Header request for the CONTENT_LENGTH header gets us the file size
+                let download_size = {
+                    let resp = client.head(&canvas_file.url).send().await.unwrap();
+                    if resp.status().is_success() {
+                        resp.headers() // Gives us the HeaderMap
+                            .get(header::CONTENT_LENGTH) // Gives us an Option containing the HeaderValue
+                            .and_then(|ct_len| ct_len.to_str().ok()) // Unwraps the Option as &str
+                            .and_then(|ct_len| ct_len.parse().ok()) // Parses the Option as u64
+                            .unwrap_or(0) // Fallback to 0
+                    } else {
+                        // We return an Error if something goes wrong here
+                        println!("Failed to download {}", canvas_file.filename);
+                        continue
+                    }
+                };
+
+                let progress_bar = progress_bars.add(ProgressBar::new(download_size));
+                progress_bar.set_style(
+                    ProgressStyle::default_bar()
+                        .template("[{bar:40.cyan/blue}] {bytes}/{total_bytes} - {msg}").unwrap()
+                        .progress_chars("=>-")
+                );
+
+                let message = format!("Downloading {} to {}", canvas_file.filename, canvas_file.filepath.to_string_lossy());
+
+                progress_bar.set_message(message);
+
+                let mut file = std::fs::File::create(&canvas_file.filepath).unwrap();
+
+                let mut file_response = client.get(&canvas_file.url)
                     .bearer_auth(&canvas_token)
                     .send()
                     .await
-                    .with_context(|| format!("Something went wrong when reaching {}", &file.url)).unwrap()
-                    .bytes()
-                    .await.unwrap();
+                    .with_context(|| format!("Something went wrong when reaching {}", &canvas_file.url)).unwrap();
 
-                {
-                    let mut file = std::fs::File::create(&file.filepath).unwrap();
-                    let mut cursor = std::io::Cursor::new(file_bytes);
+                while let Some(chunk) = file_response.chunk().await.unwrap() {
+                    progress_bar.inc(chunk.len() as u64);
+                    let mut cursor = std::io::Cursor::new(chunk);
                     std::io::copy(&mut cursor, &mut file).unwrap();
                 }
+                progress_bar.finish();
             }
         });
         

@@ -4,19 +4,19 @@
         {
             "type": "lldb",
             "request": "launch",
-            "name": "Debug executable 'canvas-cli'",
+            "name": "Debug executable 'canvas-downloader'",
             "cargo": {
                 "args": [
                     "build",
-                    "--bin=canvas-cli",
-                    "--package=canvas-cli"
+                    "--bin=canvas-downloader",
+                    "--package=canvas-downloader"
                 ],
                 "filter": {
-                    "name": "canvas-cli",
+                    "name": "canvas-downloader",
                     "kind": "bin"
                 }
             },
-            "args": ["-c", "a", "-d", "abc", "-s"],
+            "args": ["-d", "debug-folder", "-c", "test-cred.json"],
             "cwd": "${workspaceFolder}"
         }
     ]

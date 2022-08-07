@@ -1,3 +1,7 @@
+# Project specific
+debug-folder
+test-cred.json
+
 # Created by https://www.toptal.com/developers/gitignore/api/rust,visualstudiocode,macos,windows,linux,vim
 # Edit at https://www.toptal.com/developers/gitignore?templates=rust,visualstudiocode,macos,windows,linux,vim
 
