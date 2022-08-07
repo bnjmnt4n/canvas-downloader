@@ -9,6 +9,11 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+defaults:
+  run:
+    # necessary for windows
+    shell: bash
+
 jobs:
   build:
 
@@ -71,3 +76,18 @@ jobs:
           name: result
           path: |
             ./artifacts
+  # deploys to github releases on tag
+  deploy:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v2
+        with:
+          name: result
+          path: ./artifacts
+      - name: Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: ./artifacts/*
