@@ -67,13 +67,23 @@ async fn main() -> Result<()> {
 
     let client = reqwest::Client::new();
 
-    let courses = client.get(&courses_link)
+    // do not directly deserialize into canvas::Course objects
+    // there are may be courses that are restricted and not contain the fields needed to deserialise
+    let courses_json = client.get(&courses_link)
         .bearer_auth(&canvas_token)
         .send()
         .await
         .with_context(|| format!("Something went wrong when reaching {}", &courses_link))?
-        .json::<Vec<Option<canvas::Course>>>()
+        .json::<serde_json::Value>()
         .await?;
+
+    let mut courses = vec![];
+    for course_json in courses_json.as_array().unwrap() {
+        if course_json.get("enrollments").is_some() {
+            let course: canvas::Course = serde_json::from_value(course_json.to_owned()).unwrap();
+            courses.push(course);
+        }
+    }
 
     let options = ProcessOptions {
         canvas_token: canvas_token.clone(),
@@ -85,27 +95,22 @@ async fn main() -> Result<()> {
 
     println!("Courses found:");
     for course in courses {
-        match course {
-            Some(course) => {
-                println!("  * {} - {}", course.course_code, course.name);
+        println!("  * {} - {}", course.course_code, course.name);
 
-                let course_folder_path = args.destination_folder.join(course.course_code);
-                if !course_folder_path.exists() {
-                    std::fs::create_dir(&course_folder_path)
-                        .with_context(|| format!("Failed to create directory: {}", course_folder_path.to_string_lossy()))?;
-                }
-
-                // this api gives us the root folder
-                let course_folders_link = format!("{}/{}/folders/by_path/", &courses_link, course.id);
-
-                let mut new_options = options.clone();
-                new_options.link = course_folders_link;
-                new_options.parent_folder_path = course_folder_path;
-
-                process_folders(new_options).await;
-            },
-            _ => (),
+        let course_folder_path = args.destination_folder.join(course.course_code);
+        if !course_folder_path.exists() {
+            std::fs::create_dir(&course_folder_path)
+                .with_context(|| format!("Failed to create directory: {}", course_folder_path.to_string_lossy()))?;
         }
+
+        // this api gives us the root folder
+        let course_folders_link = format!("{}/{}/folders/by_path/", &courses_link, course.id);
+
+        let mut new_options = options.clone();
+        new_options.link = course_folders_link;
+        new_options.parent_folder_path = course_folder_path;
+
+        process_folders(new_options).await;
     }
 
     println!("");
@@ -121,6 +126,9 @@ async fn main() -> Result<()> {
 
     let mut join_handles = Vec::new();
     let atomic_file_index = Arc::new(AtomicUsize::new(0));
+
+    // We manually limit each worker thread to only deal with 1 file at all time to avoid
+    // spamming http requests
     for i in 0..num_worker_threads {
         let mut work = min_work;
         if i < num_worker_extra_work {
@@ -156,7 +164,7 @@ async fn main() -> Result<()> {
                 let progress_bar = progress_bars.add(ProgressBar::new(download_size));
                 progress_bar.set_style(
                     ProgressStyle::default_bar()
-                        .template("[{bar:40.cyan/blue}] {bytes}/{total_bytes} - {msg}").unwrap()
+                        .template("[{bar:20.cyan/blue}] {bytes}/{total_bytes} - {bytes_per_sec} - {msg}").unwrap()
                         .progress_chars("=>-")
                 );
 
