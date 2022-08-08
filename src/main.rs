@@ -162,9 +162,20 @@ async fn main() -> Result<()> {
                 };
 
                 let progress_bar = progress_bars.add(ProgressBar::new(download_size));
+
+                let mut bar_width_str = "bar:20";
+                termsize::get().map(|size| {
+                    // arbitrary 100
+                    if size.cols < 100 {
+                        bar_width_str = "wide_bar";
+                    }
+                });
                 progress_bar.set_style(
                     ProgressStyle::default_bar()
-                        .template("[{bar:20.cyan/blue}] {bytes}/{total_bytes} - {bytes_per_sec} - {msg}").unwrap()
+                        .template(&format!(
+                            "[{{{}:.cyan/blue}}] {{bytes}}/{{total_bytes}} - {{bytes_per_sec}} - {{msg}}",
+                            bar_width_str
+                        )).unwrap()
                         .progress_chars("=>-")
                 );
 
