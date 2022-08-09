@@ -15,3 +15,5 @@ Downloads files from all courses in canvas.
 - `./canvas-downloader -d <DESTINATION FOLDER> -c <CREDENTIAL PATH>`
     - same as the first command but reads the credentials from `<CREDENTIAL PATH>`
 - Recommended to alias the command to use `-u` and `-t`, or `-c` to avoid typing so much
+- The downloader will not download the file if there is already a file at where it should be saved to
+    - If you want the new version, you need to delete the existing file (or rename it) so that the downloader will download the new verison
