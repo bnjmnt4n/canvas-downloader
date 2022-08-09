@@ -31,8 +31,12 @@ async fn main() -> Result<()> {
                 Option::None
             }
         } else {
-            let file = std::fs::File::open(path)?;
-            serde_json::from_reader(file).expect("Crendential file is not valid json")
+            if !args.save_credentials {
+                let file = std::fs::File::open(path)?;
+                serde_json::from_reader(file).expect("Crendential file is not valid json")
+            } else {
+                Option::None
+            }
         }
     } else {
         Option::None
