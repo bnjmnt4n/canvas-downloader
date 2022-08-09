@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use canvas::ProcessOptions;
+use chrono::DateTime;
 use clap::Parser;
 use futures::{future::BoxFuture, FutureExt};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -181,6 +182,27 @@ async fn main() -> Result<()> {
                 progress_bar.set_message(message);
 
                 let mut file = std::fs::File::create(&canvas_file.filepath).unwrap();
+                // canvas also provides a modified_time of the file but updated_at should be more proper
+                // as it probably represents the upload date of the file which is more apt for determining
+                // if the file was changed since downloading it
+                match DateTime::parse_from_rfc3339(&canvas_file.updated_at) {
+                    Ok(updated_at) => {
+                        match filetime::set_file_mtime(
+                            &canvas_file.filepath,
+                            filetime::FileTime::from_unix_time(
+                                updated_at.timestamp(),
+                                updated_at.timestamp_subsec_nanos())) {
+                            Err(_) => {
+                                println!("Failed to set modified time of {} with updated_at of {}", canvas_file.filename, canvas_file.updated_at);
+                            },
+                            _ => {}
+                        };
+                    },
+                    Err(_) => {
+                        println!("Failed to parse updated_at time for {}, {}", canvas_file.filename, canvas_file.updated_at);
+                        continue;
+                    }
+                };
 
                 let mut file_response = client.get(&canvas_file.url)
                     .bearer_auth(&canvas_token)
@@ -339,6 +361,7 @@ mod canvas {
         pub filename: String,
         pub size: u64,
         pub url: String,
+        pub updated_at: String,
         #[serde(skip)]
         pub filepath: std::path::PathBuf,
     }
