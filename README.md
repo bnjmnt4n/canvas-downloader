@@ -6,7 +6,7 @@ Downloads files from all courses in canvas.
 ## Usage
 - Get your canvas url (i.e. `https://canvas.example.com`)
     - Ensure the url has 'https://'
-    - This url is the one that you would use to access the canvas website for your instituion
+    - This url is the one that you would use to access the canvas website for your institution
 - Get your api token
     - You can create one under Account > Settings > New Access Token
 - `./canvas-downloader -u <CANVAS URL> -t <CANVAS API TOKEN> -d <DESTINATION FOLDER>`
