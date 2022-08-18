@@ -1,4 +1,4 @@
-# Canvas-cli
+# canvas-downloader
 
 ## Description
 Downloads files from all courses in canvas.
