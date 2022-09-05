@@ -7,6 +7,9 @@ Downloads files from all courses in canvas.
 - To use the executable downloaded from **Releases**, use `xattr` to remove the quarantine
     - e.g. `xattr -d com.apple.quarantine canvas-downloader`
 - This occurs because the executable has not been signed with an apple developer account
+- If it is not showing up as an executable
+    - `chmod +x canvas-downloader`
+    - This should make it executable
 
 ## Usage
 - Get your canvas url (i.e. `https://canvas.example.com`)
