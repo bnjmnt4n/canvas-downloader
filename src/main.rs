@@ -33,7 +33,7 @@ async fn main() -> Result<()> {
         } else {
             if !args.save_credentials {
                 let file = std::fs::File::open(path)?;
-                serde_json::from_reader(file).expect("Crendential file is not valid json")
+                serde_json::from_reader(file).expect("Credential file is not valid json")
             } else {
                 Option::None
             }
@@ -293,6 +293,14 @@ async fn process_files(options: ProcessOptions) {
         .json::<Vec<canvas::File>>()
         .await;
     
+    fn updated(filepath: &std::path::PathBuf, new_modified: &str) -> bool {
+        || -> Result<bool> {
+            let old_modified = std::fs::metadata(filepath)?.modified()?;
+            let new_modified = std::time::SystemTime::from(DateTime::parse_from_rfc3339(new_modified)?);
+            Ok(old_modified < new_modified)
+        }().unwrap_or(false)
+    }
+    
     match files_result {
         Ok(mut files) => {
             for file in &mut files {
@@ -300,9 +308,9 @@ async fn process_files(options: ProcessOptions) {
                 file.filepath = options.parent_folder_path.join(sanitized_filename);
             }
             
-            // only download files that do not exist and match their parent folder id
+            // only download files that do not exist or are updated
             let mut filtered_files = files.into_iter()
-            .filter(|f| !f.filepath.exists())
+            .filter(|f| !f.filepath.exists() || updated(&f.filepath, &f.updated_at))
             .collect::<Vec<canvas::File>>();
             
             let mut lock = options.files_to_download.lock().await;
