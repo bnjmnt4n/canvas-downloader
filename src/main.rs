@@ -96,6 +96,7 @@ async fn main() -> Result<()> {
         parent_folder_path: PathBuf::new(),
         client: client.clone(),
         files_to_download: Arc::new(Mutex::new(Vec::new())),
+        download_newer: args.download_newer,
     };
 
     println!("Courses found:");
@@ -293,12 +294,16 @@ async fn process_files(options: ProcessOptions) {
         .json::<Vec<canvas::File>>()
         .await;
     
-    fn updated(filepath: &std::path::PathBuf, new_modified: &str) -> bool {
-        || -> Result<bool> {
+    fn updated(filepath: &PathBuf, new_modified: &str) -> bool {
+        (|| -> Result<bool> {
             let old_modified = std::fs::metadata(filepath)?.modified()?;
             let new_modified = std::time::SystemTime::from(DateTime::parse_from_rfc3339(new_modified)?);
-            Ok(old_modified < new_modified)
-        }().unwrap_or(false)
+            let updated = old_modified < new_modified;
+            if updated {
+                println!("Found update for {filepath:?}. Use -n to download updated files.");
+            }
+            Ok(updated)
+        })().unwrap_or(false)
     }
     
     match files_result {
@@ -310,7 +315,7 @@ async fn process_files(options: ProcessOptions) {
             
             // only download files that do not exist or are updated
             let mut filtered_files = files.into_iter()
-            .filter(|f| !f.filepath.exists() || updated(&f.filepath, &f.updated_at))
+            .filter(|f| !f.filepath.exists() || (updated(&f.filepath, &f.updated_at)) && options.download_newer)
             .collect::<Vec<canvas::File>>();
             
             let mut lock = options.files_to_download.lock().await;
@@ -334,6 +339,8 @@ struct CommandLineOptions {
     destination_folder: std::path::PathBuf,
     #[clap(short = 's', long, takes_value = false)]
     save_credentials: bool,
+    #[clap(short = 'n', long, takes_value = false)]
+    download_newer: bool,
 }
 
 mod canvas {
@@ -385,5 +392,6 @@ mod canvas {
         pub link: String,
         pub parent_folder_path: std::path::PathBuf,
         pub files_to_download: Arc<Mutex<Vec<File>>>,
+        pub download_newer: bool,
     }
 }
