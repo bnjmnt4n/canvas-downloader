@@ -18,14 +18,9 @@ use tokio::sync::Mutex;
 async fn main() -> Result<()> {
     let args = CommandLineOptions::parse();
 
-    if (args.canvas_url.is_none() || args.canvas_token.is_none())
-        && args.canvas_credential_path.is_none()
-    {
-        panic!(
-            "Provide canvas url and token via -u and -t respectively or via a credential file -c"
-        );
-    }
+    let cred = parse_credentials(&args);
 
+    // Create sub-folder if not exists
     if !args.destination_folder.exists() {
         std::fs::create_dir(&args.destination_folder).with_context(|| {
             format!(
@@ -35,52 +30,7 @@ async fn main() -> Result<()> {
         })?;
     }
 
-    let credentials: Option<canvas::Credentials> = if args.canvas_credential_path.is_some() {
-        let path = args.canvas_credential_path.clone().unwrap();
-
-        if !path.exists() {
-            if !args.save_credentials {
-                panic!("The given path to the credentials file does not exists");
-            } else {
-                None
-            }
-        } else if !args.save_credentials {
-            let file = std::fs::File::open(path)?;
-            serde_json::from_reader(file).expect("Credential file is not valid json")
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    let canvas_url = if args.canvas_url.is_some() {
-        args.canvas_url.unwrap()
-    } else {
-        credentials.clone().unwrap().canvas_url
-    };
-
-    let canvas_token = if args.canvas_token.is_some() {
-        args.canvas_token.unwrap()
-    } else {
-        credentials.clone().unwrap().canvas_token
-    };
-
-    if args.save_credentials {
-        if args.canvas_credential_path.is_none() {
-            panic!("Provide the destination path to save the credential to");
-        }
-
-        let path = args.canvas_credential_path.clone().unwrap();
-        let file = std::fs::File::create(path)?;
-        let credentials = canvas::Credentials {
-            canvas_url: canvas_url.clone(),
-            canvas_token: canvas_token.clone(),
-        };
-        serde_json::to_writer_pretty(file, &credentials)?;
-    }
-
-    let courses_link = format!("{}/api/v1/courses", canvas_url);
+    let courses_link = format!("{}/api/v1/courses", cred.canvas_url);
 
     let client = reqwest::Client::new();
 
@@ -88,7 +38,7 @@ async fn main() -> Result<()> {
     // there are may be courses that are restricted and not contain the fields needed to deserialize
     let courses_json = client
         .get(&courses_link)
-        .bearer_auth(&canvas_token)
+        .bearer_auth(&cred.canvas_token)
         .send()
         .await
         .with_context(|| format!("Something went wrong when reaching {}", &courses_link))?
@@ -104,7 +54,7 @@ async fn main() -> Result<()> {
     }
 
     let options = ProcessOptions {
-        canvas_token: canvas_token.clone(),
+        canvas_token: cred.canvas_token.clone(),
         link: String::from(""),
         parent_folder_path: PathBuf::new(),
         client: client.clone(),
@@ -171,7 +121,7 @@ async fn main() -> Result<()> {
         if i < num_worker_extra_work {
             work += 1;
         }
-        let canvas_token = canvas_token.clone();
+        let canvas_token = cred.canvas_token.clone();
         let client = client.clone();
         let files_to_download = files_to_download.clone();
         let progress_bars = progress_bars.clone();
@@ -281,6 +231,43 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn parse_credentials(args: &CommandLineOptions) -> canvas::Credentials {
+    // Parse...
+    let cred = if let (Some(url), Some(token)) = (&args.canvas_url, &args.canvas_token) {
+        // ...from CLI
+        canvas::Credentials {
+            canvas_url: url.clone(),
+            canvas_token: token.clone(),
+        }
+    } else if let Some(path) = &args.canvas_credential_path {
+        // ...from file
+        assert!(
+            !args.save_credentials,
+            "To save credentials, please provide url and token via -u and -t respectively"
+        );
+        let file = std::fs::File::open(path)
+            .unwrap_or_else(|e| panic!("Could not open credential file, err={e}"));
+        serde_json::from_reader(file).expect("Credential file is not valid json")
+    } else {
+        panic!(
+            "Provide canvas url and token via -u and -t respectively or via a credential file -c"
+        );
+    };
+
+    // Save credentials
+    if args.save_credentials {
+        let Some(path) = &args.canvas_credential_path else {
+            panic!("To save credentials, please provide credential file via -c");
+        };
+        let file = std::fs::File::create(path)
+            .unwrap_or_else(|e| panic!("Could not open credential file, err={e}"));
+        serde_json::to_writer_pretty(file, &cred)
+            .unwrap_or_else(|e| panic!("Could not write credential file, err={e}"));
+    }
+
+    cred
 }
 
 // async recursion needs boxing
