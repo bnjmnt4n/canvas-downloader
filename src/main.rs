@@ -42,18 +42,16 @@ async fn main() -> Result<()> {
             if !args.save_credentials {
                 panic!("The given path to the credentials file does not exists");
             } else {
-                Option::None
+                None
             }
+        } else if !args.save_credentials {
+            let file = std::fs::File::open(path)?;
+            serde_json::from_reader(file).expect("Credential file is not valid json")
         } else {
-            if !args.save_credentials {
-                let file = std::fs::File::open(path)?;
-                serde_json::from_reader(file).expect("Credential file is not valid json")
-            } else {
-                Option::None
-            }
+            None
         }
     } else {
-        Option::None
+        None
     };
 
     let canvas_url = if args.canvas_url.is_some() {
@@ -87,7 +85,7 @@ async fn main() -> Result<()> {
     let client = reqwest::Client::new();
 
     // do not directly deserialize into canvas::Course objects
-    // there are may be courses that are restricted and not contain the fields needed to deserialise
+    // there are may be courses that are restricted and not contain the fields needed to deserialize
     let courses_json = client
         .get(&courses_link)
         .bearer_auth(&canvas_token)
@@ -140,7 +138,7 @@ async fn main() -> Result<()> {
         process_folders(new_options).await;
     }
 
-    println!("");
+    println!();
 
     // Tokio uses the number of cpus as num of work threads in the default runtime
     let num_worker_threads = num_cpus::get();
@@ -202,14 +200,11 @@ async fn main() -> Result<()> {
 
                 let progress_bar = progress_bars.add(ProgressBar::new(download_size));
 
-                let mut style_template =
-                    "[{bar:20.cyan/blue}] {bytes}/{total_bytes} - {bytes_per_sec} - {msg}";
-                termsize::get().map(|size| {
-                    // arbitrary 100
-                    if size.cols < 100 {
-                        style_template = "[{wide_bar:.cyan/blue}] {total_bytes} - {msg}";
-                    }
-                });
+                let style_template = if termsize::get().map_or(false, |size| size.cols < 100) {
+                    "[{wide_bar:.cyan/blue}] {total_bytes} - {msg}"
+                } else {
+                    "[{bar:20.cyan/blue}] {bytes}/{total_bytes} - {bytes_per_sec} - {msg}"
+                };
                 progress_bar.set_style(
                     ProgressStyle::default_bar()
                         .template(style_template)
@@ -217,7 +212,7 @@ async fn main() -> Result<()> {
                         .progress_chars("=>-"),
                 );
 
-                let message = format!("{}", canvas_file.display_name);
+                let message = canvas_file.display_name.to_string();
 
                 progress_bar.set_message(message);
 
@@ -227,20 +222,19 @@ async fn main() -> Result<()> {
                 // if the file was changed since downloading it
                 match DateTime::parse_from_rfc3339(&canvas_file.updated_at) {
                     Ok(updated_at) => {
-                        match filetime::set_file_mtime(
+                        if filetime::set_file_mtime(
                             &canvas_file.filepath,
                             filetime::FileTime::from_unix_time(
                                 updated_at.timestamp(),
                                 updated_at.timestamp_subsec_nanos(),
                             ),
-                        ) {
-                            Err(_) => {
-                                println!(
-                                    "Failed to set modified time of {} with updated_at of {}",
-                                    canvas_file.display_name, canvas_file.updated_at
-                                );
-                            }
-                            _ => {}
+                        )
+                        .is_err()
+                        {
+                            println!(
+                                "Failed to set modified time of {} with updated_at of {}",
+                                canvas_file.display_name, canvas_file.updated_at
+                            );
                         };
                     }
                     Err(_) => {
@@ -296,7 +290,7 @@ fn process_folders(options: ProcessOptions) -> BoxFuture<'static, ()> {
         let folders_result = options
             .client
             .get(&options.link)
-            .bearer_auth(&canvas_token)
+            .bearer_auth(canvas_token)
             .send()
             .await
             .with_context(|| format!("Something went wrong when reaching {}", &options.link))
@@ -439,9 +433,9 @@ struct CommandLineOptions {
     #[clap(short = 't', long, forbid_empty_values = true)]
     canvas_token: Option<String>,
     #[clap(short = 'c', long, parse(from_os_str), forbid_empty_values = true)]
-    canvas_credential_path: Option<std::path::PathBuf>,
+    canvas_credential_path: Option<PathBuf>,
     #[clap(short = 'd', long, parse(from_os_str), default_value = ".")]
-    destination_folder: std::path::PathBuf,
+    destination_folder: PathBuf,
     #[clap(short = 's', long, takes_value = false)]
     save_credentials: bool,
     #[clap(short = 'n', long, takes_value = false)]
