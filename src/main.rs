@@ -162,7 +162,7 @@ async fn main() -> Result<()> {
                             .unwrap_or(0) // Fallback to 0
                     } else {
                         // We return an Error if something goes wrong here
-                        println!("Failed to download {}", canvas_file.filename);
+                        println!("Failed to download {}", canvas_file.display_name);
                         continue
                     }
                 };
@@ -182,7 +182,7 @@ async fn main() -> Result<()> {
                         .progress_chars("=>-")
                 );
 
-                let message = format!("{}", canvas_file.filename);
+                let message = format!("{}", canvas_file.display_name);
 
                 progress_bar.set_message(message);
 
@@ -198,13 +198,13 @@ async fn main() -> Result<()> {
                                 updated_at.timestamp(),
                                 updated_at.timestamp_subsec_nanos())) {
                             Err(_) => {
-                                println!("Failed to set modified time of {} with updated_at of {}", canvas_file.filename, canvas_file.updated_at);
+                                println!("Failed to set modified time of {} with updated_at of {}", canvas_file.display_name, canvas_file.updated_at);
                             },
                             _ => {}
                         };
                     },
                     Err(_) => {
-                        println!("Failed to parse updated_at time for {}, {}", canvas_file.filename, canvas_file.updated_at);
+                        println!("Failed to parse updated_at time for {}, {}", canvas_file.display_name, canvas_file.updated_at);
                         continue;
                     }
                 };
@@ -232,7 +232,7 @@ async fn main() -> Result<()> {
     }
 
     for canvas_file in Arc::try_unwrap(files_to_download).unwrap() {
-        println!("Downloaded {} to {}", canvas_file.filename, canvas_file.filepath.to_string_lossy());
+        println!("Downloaded {} to {}", canvas_file.display_name, canvas_file.filepath.to_string_lossy());
     }
 
     Ok(())
@@ -309,7 +309,7 @@ async fn process_files(options: ProcessOptions) {
     match files_result {
         Ok(mut files) => {
             for file in &mut files {
-                let sanitized_filename = sanitize_filename::sanitize(&file.filename);
+                let sanitized_filename = sanitize_filename::sanitize(&file.display_name);
                 file.filepath = options.parent_folder_path.join(sanitized_filename);
             }
             
@@ -377,7 +377,7 @@ mod canvas {
     pub struct File {
         pub id: u32,
         pub folder_id: u32,
-        pub filename: String,
+        pub display_name: String,
         pub size: u64,
         pub url: String,
         pub updated_at: String,
