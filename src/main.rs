@@ -5,20 +5,34 @@ use clap::Parser;
 use futures::{future::BoxFuture, FutureExt};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::header;
-use std::{sync::{Arc, atomic::{AtomicUsize, Ordering}}, path::PathBuf};
+use std::{
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
 use tokio::sync::Mutex;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = CommandLineOptions::parse();
 
-    if (args.canvas_url.is_none() || args.canvas_token.is_none()) && args.canvas_credential_path.is_none() {
-        panic!("Provide canvas url and token via -u and -t respectively or via a credential file -c");
+    if (args.canvas_url.is_none() || args.canvas_token.is_none())
+        && args.canvas_credential_path.is_none()
+    {
+        panic!(
+            "Provide canvas url and token via -u and -t respectively or via a credential file -c"
+        );
     }
 
     if !args.destination_folder.exists() {
-        std::fs::create_dir(&args.destination_folder)
-            .with_context(|| format!("Failed to create directory: {}", args.destination_folder.to_string_lossy()))?;
+        std::fs::create_dir(&args.destination_folder).with_context(|| {
+            format!(
+                "Failed to create directory: {}",
+                args.destination_folder.to_string_lossy()
+            )
+        })?;
     }
 
     let credentials: Option<canvas::Credentials> = if args.canvas_credential_path.is_some() {
@@ -74,7 +88,8 @@ async fn main() -> Result<()> {
 
     // do not directly deserialize into canvas::Course objects
     // there are may be courses that are restricted and not contain the fields needed to deserialise
-    let courses_json = client.get(&courses_link)
+    let courses_json = client
+        .get(&courses_link)
         .bearer_auth(&canvas_token)
         .send()
         .await
@@ -129,12 +144,24 @@ async fn main() -> Result<()> {
 
     // Tokio uses the number of cpus as num of work threads in the default runtime
     let num_worker_threads = num_cpus::get();
-    let files_to_download = Arc::new(Arc::try_unwrap(options.files_to_download).unwrap().into_inner());
+    let files_to_download = Arc::new(
+        Arc::try_unwrap(options.files_to_download)
+            .unwrap()
+            .into_inner(),
+    );
     let num_worker_extra_work = files_to_download.len() % num_worker_threads;
     let min_work = files_to_download.len() / num_worker_threads;
     let progress_bars = Arc::new(MultiProgress::new());
 
-    println!("Downloading {} file{}", files_to_download.len(), if files_to_download.len() == 1 { "" } else { "s" } );
+    println!(
+        "Downloading {} file{}",
+        files_to_download.len(),
+        if files_to_download.len() == 1 {
+            ""
+        } else {
+            "s"
+        }
+    );
 
     let mut join_handles = Vec::new();
     let atomic_file_index = Arc::new(AtomicUsize::new(0));
@@ -169,13 +196,14 @@ async fn main() -> Result<()> {
                     } else {
                         // We return an Error if something goes wrong here
                         println!("Failed to download {}", canvas_file.display_name);
-                        continue
+                        continue;
                     }
                 };
 
                 let progress_bar = progress_bars.add(ProgressBar::new(download_size));
 
-                let mut style_template = "[{bar:20.cyan/blue}] {bytes}/{total_bytes} - {bytes_per_sec} - {msg}";
+                let mut style_template =
+                    "[{bar:20.cyan/blue}] {bytes}/{total_bytes} - {bytes_per_sec} - {msg}";
                 termsize::get().map(|size| {
                     // arbitrary 100
                     if size.cols < 100 {
@@ -184,8 +212,9 @@ async fn main() -> Result<()> {
                 });
                 progress_bar.set_style(
                     ProgressStyle::default_bar()
-                        .template(style_template).unwrap()
-                        .progress_chars("=>-")
+                        .template(style_template)
+                        .unwrap()
+                        .progress_chars("=>-"),
                 );
 
                 let message = format!("{}", canvas_file.display_name);
@@ -202,24 +231,36 @@ async fn main() -> Result<()> {
                             &canvas_file.filepath,
                             filetime::FileTime::from_unix_time(
                                 updated_at.timestamp(),
-                                updated_at.timestamp_subsec_nanos())) {
+                                updated_at.timestamp_subsec_nanos(),
+                            ),
+                        ) {
                             Err(_) => {
-                                println!("Failed to set modified time of {} with updated_at of {}", canvas_file.display_name, canvas_file.updated_at);
-                            },
+                                println!(
+                                    "Failed to set modified time of {} with updated_at of {}",
+                                    canvas_file.display_name, canvas_file.updated_at
+                                );
+                            }
                             _ => {}
                         };
-                    },
+                    }
                     Err(_) => {
-                        println!("Failed to parse updated_at time for {}, {}", canvas_file.display_name, canvas_file.updated_at);
+                        println!(
+                            "Failed to parse updated_at time for {}, {}",
+                            canvas_file.display_name, canvas_file.updated_at
+                        );
                         continue;
                     }
                 };
 
-                let mut file_response = client.get(&canvas_file.url)
+                let mut file_response = client
+                    .get(&canvas_file.url)
                     .bearer_auth(&canvas_token)
                     .send()
                     .await
-                    .with_context(|| format!("Something went wrong when reaching {}", &canvas_file.url)).unwrap();
+                    .with_context(|| {
+                        format!("Something went wrong when reaching {}", &canvas_file.url)
+                    })
+                    .unwrap();
 
                 while let Some(chunk) = file_response.chunk().await.unwrap() {
                     progress_bar.inc(chunk.len() as u64);
@@ -229,7 +270,7 @@ async fn main() -> Result<()> {
                 progress_bar.finish();
             }
         });
-        
+
         join_handles.push(handle);
     }
 
@@ -238,7 +279,11 @@ async fn main() -> Result<()> {
     }
 
     for canvas_file in Arc::try_unwrap(files_to_download).unwrap() {
-        println!("Downloaded {} to {}", canvas_file.display_name, canvas_file.filepath.to_string_lossy());
+        println!(
+            "Downloaded {} to {}",
+            canvas_file.display_name,
+            canvas_file.filepath.to_string_lossy()
+        );
     }
 
     Ok(())
@@ -248,14 +293,17 @@ async fn main() -> Result<()> {
 fn process_folders(options: ProcessOptions) -> BoxFuture<'static, ()> {
     async move {
         let canvas_token = &options.canvas_token;
-        let folders_result = options.client.get(&options.link)
+        let folders_result = options
+            .client
+            .get(&options.link)
             .bearer_auth(&canvas_token)
             .send()
             .await
-            .with_context(|| format!("Something went wrong when reaching {}", &options.link)).unwrap()
+            .with_context(|| format!("Something went wrong when reaching {}", &options.link))
+            .unwrap()
             .json::<canvas::FolderResult>()
             .await;
-        
+
         match folders_result {
             Ok(canvas::FolderResult::Ok(folders)) => {
                 for folder in folders {
@@ -264,83 +312,122 @@ fn process_folders(options: ProcessOptions) -> BoxFuture<'static, ()> {
                     // if the folder has no parent, it is the root folder of a course
                     // so we avoid the extra directory nesting by not appending the root folder name
                     let folder_path = if folder.parent_folder_id.is_some() {
-                        options.parent_folder_path.clone().join(sanitized_folder_name)
+                        options
+                            .parent_folder_path
+                            .clone()
+                            .join(sanitized_folder_name)
                     } else {
                         options.parent_folder_path.clone()
                     };
                     if !folder_path.exists() {
                         std::fs::create_dir(&folder_path)
-                            .with_context(|| format!("Failed to create directory: {}", folder_path.to_string_lossy())).unwrap();
+                            .with_context(|| {
+                                format!(
+                                    "Failed to create directory: {}",
+                                    folder_path.to_string_lossy()
+                                )
+                            })
+                            .unwrap();
                     }
 
                     let mut new_options = options.clone();
                     new_options.link = folder.files_url.clone();
                     new_options.parent_folder_path = folder_path.clone();
                     process_files(new_options).await;
-        
+
                     let mut new_options = options.clone();
                     new_options.link = folder.folders_url.clone();
                     new_options.parent_folder_path = folder_path.clone();
                     process_folders(new_options).await;
                 }
-            },
-            Ok(canvas::FolderResult::Err{status}) => {
+            }
+            Ok(canvas::FolderResult::Err { status }) => {
                 let course_has_no_folders = status == "unauthorized";
                 if !course_has_no_folders {
-                    println!("Failed to access folders at link:{}, path:{}, status:{}", options.link, options.parent_folder_path.to_string_lossy(), status);
+                    println!(
+                        "Failed to access folders at link:{}, path:{}, status:{}",
+                        options.link,
+                        options.parent_folder_path.to_string_lossy(),
+                        status
+                    );
                 }
-            },
+            }
             Err(e) => {
-                println!("Failed to deserialize folders at link:{}, path:{}\n{:?}", &options.link, &options.parent_folder_path.to_string_lossy(), e);
+                println!(
+                    "Failed to deserialize folders at link:{}, path:{}\n{:?}",
+                    &options.link,
+                    &options.parent_folder_path.to_string_lossy(),
+                    e
+                );
             }
         }
-    }.boxed()
+    }
+    .boxed()
 }
 
 async fn process_files(options: ProcessOptions) {
-    let files_result = options.client.get(&options.link)
+    let files_result = options
+        .client
+        .get(&options.link)
         .bearer_auth(&options.canvas_token)
         .send()
         .await
-        .with_context(|| format!("Something went wrong when reaching {}", &options.link)).unwrap()
+        .with_context(|| format!("Something went wrong when reaching {}", &options.link))
+        .unwrap()
         .json::<canvas::FileResult>()
         .await;
-    
+
     fn updated(filepath: &PathBuf, new_modified: &str) -> bool {
         (|| -> Result<bool> {
             let old_modified = std::fs::metadata(filepath)?.modified()?;
-            let new_modified = std::time::SystemTime::from(DateTime::parse_from_rfc3339(new_modified)?);
+            let new_modified =
+                std::time::SystemTime::from(DateTime::parse_from_rfc3339(new_modified)?);
             let updated = old_modified < new_modified;
             if updated {
                 println!("Found update for {filepath:?}. Use -n to download updated files.");
             }
             Ok(updated)
-        })().unwrap_or(false)
+        })()
+        .unwrap_or(false)
     }
-    
+
     match files_result {
         Ok(canvas::FileResult::Ok(mut files)) => {
             for file in &mut files {
                 let sanitized_filename = sanitize_filename::sanitize(&file.display_name);
                 file.filepath = options.parent_folder_path.join(sanitized_filename);
             }
-            
+
             // only download files that do not exist or are updated
-            let mut filtered_files = files.into_iter()
-            .filter(|f| !f.filepath.exists() || (updated(&f.filepath, &f.updated_at)) && options.download_newer)
-            .collect::<Vec<canvas::File>>();
-            
+            let mut filtered_files = files
+                .into_iter()
+                .filter(|f| {
+                    !f.filepath.exists()
+                        || (updated(&f.filepath, &f.updated_at)) && options.download_newer
+                })
+                .collect::<Vec<canvas::File>>();
+
             let mut lock = options.files_to_download.lock().await;
             lock.append(&mut filtered_files);
-        },
+        }
         Ok(canvas::FileResult::Err { status }) => {
             let course_has_no_files = status == "unauthorized";
             if !course_has_no_files {
-                println!("Failed to access files at link:{}, path:{}, status:{}", options.link, options.parent_folder_path.to_string_lossy(), status);
+                println!(
+                    "Failed to access files at link:{}, path:{}, status:{}",
+                    options.link,
+                    options.parent_folder_path.to_string_lossy(),
+                    status
+                );
             }
         }
         Err(e) => {
-            println!("Failed to deserialize files at link:{}, path:{}\n{:?}", &options.link, &options.parent_folder_path.to_string_lossy(), e);
+            println!(
+                "Failed to deserialize files at link:{}, path:{}\n{:?}",
+                &options.link,
+                &options.parent_folder_path.to_string_lossy(),
+                e
+            );
         }
     };
 }
@@ -386,7 +473,7 @@ mod canvas {
         Err { status: String },
         Ok(Vec<Folder>),
     }
-    
+
     #[derive(Deserialize)]
     pub struct Folder {
         pub id: u32,
