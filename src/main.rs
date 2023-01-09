@@ -247,11 +247,11 @@ fn process_folders(options: ProcessOptions) -> BoxFuture<'static, ()> {
             .send()
             .await
             .with_context(|| format!("Something went wrong when reaching {}", &options.link)).unwrap()
-            .json::<Vec<canvas::Folder>>()
+            .json::<canvas::FolderResult>()
             .await;
         
         match folders_result {
-            Ok(folders) => {
+            Ok(canvas::FolderResult::Ok(folders)) => {
                 for folder in folders {
                     // println!("  * {} - {}", folder.id, folder.name);
                     let sanitized_folder_name = sanitize_filename::sanitize(folder.name);
@@ -278,8 +278,14 @@ fn process_folders(options: ProcessOptions) -> BoxFuture<'static, ()> {
                     process_folders(new_options).await;
                 }
             },
+            Ok(canvas::FolderResult::Err{status}) => {
+                let course_has_no_folders = status == "unauthorized";
+                if !course_has_no_folders {
+                    println!("Failed to access folders at link:{}, path:{}, status:{}", options.link, options.parent_folder_path.to_string_lossy(), status);
+                }
+            },
             Err(e) => {
-                println!("Failed to deserialize folders at link:{}, path:{}\n{}", &options.link, &options.parent_folder_path.to_string_lossy(), e.to_string());
+                println!("Failed to deserialize folders at link:{}, path:{}\n{:?}", &options.link, &options.parent_folder_path.to_string_lossy(), e);
             }
         }
     }.boxed()
@@ -291,7 +297,7 @@ async fn process_files(options: ProcessOptions) {
         .send()
         .await
         .with_context(|| format!("Something went wrong when reaching {}", &options.link)).unwrap()
-        .json::<Vec<canvas::File>>()
+        .json::<canvas::FileResult>()
         .await;
     
     fn updated(filepath: &PathBuf, new_modified: &str) -> bool {
@@ -307,7 +313,7 @@ async fn process_files(options: ProcessOptions) {
     }
     
     match files_result {
-        Ok(mut files) => {
+        Ok(canvas::FileResult::Ok(mut files)) => {
             for file in &mut files {
                 let sanitized_filename = sanitize_filename::sanitize(&file.display_name);
                 file.filepath = options.parent_folder_path.join(sanitized_filename);
@@ -321,8 +327,14 @@ async fn process_files(options: ProcessOptions) {
             let mut lock = options.files_to_download.lock().await;
             lock.append(&mut filtered_files);
         },
+        Ok(canvas::FileResult::Err { status }) => {
+            let course_has_no_files = status == "unauthorized";
+            if !course_has_no_files {
+                println!("Failed to access files at link:{}, path:{}, status:{}", options.link, options.parent_folder_path.to_string_lossy(), status);
+            }
+        }
         Err(e) => {
-            println!("Failed to deserialize files at link:{}, path:{}\n{}", &options.link, &options.parent_folder_path.to_string_lossy(), e.to_string());
+            println!("Failed to deserialize files at link:{}, path:{}\n{:?}", &options.link, &options.parent_folder_path.to_string_lossy(), e);
         }
     };
 }
@@ -361,6 +373,13 @@ mod canvas {
         pub name: String,
         pub course_code: String,
     }
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    pub(crate) enum FolderResult {
+        Err { status: String },
+        Ok(Vec<Folder>),
+    }
     
     #[derive(Deserialize)]
     pub struct Folder {
@@ -372,7 +391,14 @@ mod canvas {
         pub can_upload: bool,
         pub parent_folder_id: Option<u32>,
     }
-    
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    pub(crate) enum FileResult {
+        Err { status: String },
+        Ok(Vec<File>),
+    }
+
     #[derive(Clone, Debug, Deserialize)]
     pub struct File {
         pub id: u32,
