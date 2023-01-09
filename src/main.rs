@@ -103,10 +103,16 @@ async fn main() -> Result<()> {
     for course in courses {
         println!("  * {} - {}", course.course_code, course.name);
 
-        let course_folder_path = args.destination_folder.join(course.course_code);
+        let course_folder_path = args
+            .destination_folder
+            .join(course.course_code.replace("/", "_"));
         if !course_folder_path.exists() {
-            std::fs::create_dir(&course_folder_path)
-                .with_context(|| format!("Failed to create directory: {}", course_folder_path.to_string_lossy()))?;
+            std::fs::create_dir(&course_folder_path).with_context(|| {
+                format!(
+                    "Failed to create directory: {}",
+                    course_folder_path.to_string_lossy()
+                )
+            })?;
         }
 
         // this api gives us the root folder
