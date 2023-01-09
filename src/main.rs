@@ -34,24 +34,27 @@ async fn main() -> Result<()> {
 
     let client = reqwest::Client::new();
 
-    // do not directly deserialize into canvas::Course objects
-    // there are may be courses that are restricted and not contain the fields needed to deserialize
-    let courses_json = client
+    // Get courses
+    let courses: Vec<canvas::Course> = client
+        // GET request
         .get(&courses_link)
         .bearer_auth(&cred.canvas_token)
         .send()
         .await
-        .with_context(|| format!("Something went wrong when reaching {}", &courses_link))?
-        .json::<serde_json::Value>()
-        .await?;
-
-    let mut courses = vec![];
-    for course_json in courses_json.as_array().unwrap() {
-        if course_json.get("enrollments").is_some() {
-            let course: canvas::Course = serde_json::from_value(course_json.to_owned()).unwrap();
-            courses.push(course);
-        }
-    }
+        .unwrap_or_else(|e| panic!("Something went wrong when reaching {courses_link}, err={e}"))
+        // Parse json
+        .json::<Vec<serde_json::Value>>()
+        .await?
+        // Filter valid courses
+        .into_iter()
+        .filter_map(|course_json| {
+            course_json.get("enrollments").and_then(|_| {
+                serde_json::from_value(course_json.clone()).unwrap_or_else(|e| {
+                    panic!("Could not parse course with json={course_json}, err={e}")
+                })
+            })
+        })
+        .collect();
 
     let options = ProcessOptions {
         canvas_token: cred.canvas_token.clone(),
