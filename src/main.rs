@@ -89,11 +89,12 @@ async fn main() -> Result<()> {
     // Invariants
     // 1. <=nCPU concurrently: guaranteed by acquiring semaphore before request and releasing after
     // 2. No starvation: spawns are done acyclic and tasks always finish
-    // 3. Race free:
+    // 3. Barrier semantics:
     //    1. Initial: n_active_requests > 0 from spawn_process()
     //    2. Recursion: spawn_process() +1 for subtasks before -1 own task
     //    3. --> n_active_requests == 0 only after all tasks done
-    // 4. No busy wait: main thread does not busy wait because semaphore is FIFO.
+    //    4. --> main() progresses only after all files have been queried
+    // 4. No busy wait: main() does not busy wait because semaphore is FIFO.
     //    A better (but longer) solution is for the last process_file/folder wake a condition var
     loop {
         let _permit =
@@ -101,15 +102,20 @@ async fn main() -> Result<()> {
                 panic!("Please report on GitHub. Unexpected closed sem, err={e}")
             });
         if options.n_active_requests.load(Ordering::Acquire) == 0 {
-            options.request_permits.close(); // sanity check: running tasks trying to acquire sem will panic
+            // Sanity check: running tasks trying to acquire sem will panic
+            options.request_permits.close();
             break;
         }
     }
+    // Sanity check: since there are no running tasks, main() should be the only reference
+    let options = Arc::try_unwrap(options).unwrap_or_else(|e| {
+        panic!("Please report on GitHub. Main should be sole reference, err={e:?}")
+    });
     println!();
 
     // Tokio uses the number of cpus as num of work threads in the default runtime
     let num_worker_threads = num_cpus::get();
-    let files_to_download = Arc::new(options.files_to_download.lock().await.clone());
+    let files_to_download = Arc::new(options.files_to_download.into_inner());
     let num_worker_extra_work = files_to_download.len() % num_worker_threads;
     let min_work = files_to_download.len() / num_worker_threads;
     let progress_bars = Arc::new(MultiProgress::new());
@@ -517,6 +523,7 @@ mod canvas {
         pub filepath: std::path::PathBuf,
     }
 
+    #[derive(Debug)]
     pub struct ProcessOptions {
         pub canvas_token: String,
         pub client: reqwest::Client,
