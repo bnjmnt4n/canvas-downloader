@@ -68,13 +68,13 @@ async fn main() -> Result<()> {
         serde_json::to_writer_pretty(file, &credentials)?;
     }
 
-    let courses_link = format!("{}/api/v1/courses", canvas_url);
-
     let client = reqwest::Client::new();
 
     // do not directly deserialize into canvas::Course objects
     // there are may be courses that are restricted and not contain the fields needed to deserialise
-    let courses_json = client.get(&courses_link)
+    let courses_link = format!("{}/api/v1/users/self/favorites/courses", canvas_url);
+    let courses_json = client
+        .get(&courses_link)
         .bearer_auth(&canvas_token)
         .send()
         .await
@@ -116,7 +116,10 @@ async fn main() -> Result<()> {
         }
 
         // this api gives us the root folder
-        let course_folders_link = format!("{}/{}/folders/by_path/", &courses_link, course.id);
+        let course_folders_link = format!(
+            "{}/api/v1/courses/{}/folders/by_path/",
+            canvas_url, course.id
+        );
 
         let mut new_options = options.clone();
         new_options.link = course_folders_link;
