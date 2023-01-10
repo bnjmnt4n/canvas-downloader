@@ -4,7 +4,6 @@ use anyhow::{Context, Result};
 use canvas::ProcessOptions;
 use chrono::DateTime;
 use clap::Parser;
-use futures::{future::BoxFuture, FutureExt};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::header;
 use std::{
@@ -58,8 +57,8 @@ async fn main() -> Result<()> {
         client: client.clone(),
         files_to_download: Mutex::new(Vec::new()),
         download_newer: args.download_newer,
-        concurrent_reqs: Semaphore::new(num_cpus::get()),
-        n_active_reqs: AtomicUsize::new(0),
+        request_permits: Semaphore::new(num_cpus::get()),
+        n_active_requests: AtomicUsize::new(0),
     });
 
     println!("Courses found:");
@@ -84,9 +83,28 @@ async fn main() -> Result<()> {
             cred.canvas_url, course.id
         );
 
-        process_folders(options.clone(), course_folders_link, course_folder_path).await;
+        spawn_process_folders(options.clone(), course_folders_link, course_folder_path);
     }
 
+    // Invariants
+    // 1. <=nCPU concurrently: guaranteed by acquiring semaphore before request and releasing after
+    // 2. No starvation: spawns are done acyclic and tasks always finish
+    // 3. Race free:
+    //    1. Initial: n_active_requests > 0 from spawn_process()
+    //    2. Recursion: spawn_process() +1 for subtasks before -1 own task
+    //    3. --> n_active_requests == 0 only after all tasks done
+    // 4. No busy wait: main thread does not busy wait because semaphore is FIFO.
+    //    A better (but longer) solution is for the last process_file/folder wake a condition var
+    loop {
+        let _permit =
+            options.request_permits.acquire().await.unwrap_or_else(|e| {
+                panic!("Please report on GitHub. Unexpected closed sem, err={e}")
+            });
+        if options.n_active_requests.load(Ordering::Acquire) == 0 {
+            options.request_permits.close(); // sanity check: running tasks trying to acquire sem will panic
+            break;
+        }
+    }
     println!();
 
     // Tokio uses the number of cpus as num of work threads in the default runtime
@@ -290,74 +308,85 @@ fn parse_credentials(args: &CommandLineOptions) -> canvas::Credentials {
     cred
 }
 
-// async recursion needs boxing
-fn process_folders(
-    options: Arc<ProcessOptions>,
-    url: String,
-    path: PathBuf,
-) -> BoxFuture<'static, ()> {
-    async move {
-        let canvas_token = &options.canvas_token;
-        let folders_result = options
-            .client
-            .get(&url)
-            .bearer_auth(canvas_token)
-            .send()
-            .await
-            .unwrap_or_else(|e| panic!("Something went wrong when reaching {url}, err={e}"))
-            .json::<canvas::FolderResult>()
-            .await;
+fn spawn_process_folders(options: Arc<ProcessOptions>, url: String, path: PathBuf) {
+    options.n_active_requests.fetch_add(1, Ordering::AcqRel);
+    tokio::spawn(async move {
+        let _permit =
+            options.request_permits.acquire().await.unwrap_or_else(|e| {
+                panic!("Please report on GitHub. Unexpected closed sem, err={e}")
+            });
+        process_folders(options.clone(), url, path).await;
+        options.n_active_requests.fetch_sub(1, Ordering::AcqRel);
+    });
+}
 
-        match folders_result {
-            Ok(canvas::FolderResult::Ok(folders)) => {
-                for folder in folders {
-                    // println!("  * {} - {}", folder.id, folder.name);
-                    let sanitized_folder_name = sanitize_filename::sanitize(folder.name);
-                    // if the folder has no parent, it is the root folder of a course
-                    // so we avoid the extra directory nesting by not appending the root folder name
-                    let folder_path = if folder.parent_folder_id.is_some() {
-                        path.clone().join(sanitized_folder_name)
-                    } else {
-                        path.clone()
-                    };
-                    if !folder_path.exists() {
-                        std::fs::create_dir(&folder_path).unwrap_or_else(|e| {
-                            panic!(
-                                "Failed to create directory: {}, err={e}",
-                                folder_path.to_string_lossy()
-                            )
-                        });
-                    }
+fn spawn_process_files(options: Arc<ProcessOptions>, url: String, path: PathBuf) {
+    options.n_active_requests.fetch_add(1, Ordering::AcqRel);
+    tokio::spawn(async move {
+        let _permit =
+            options.request_permits.acquire().await.unwrap_or_else(|e| {
+                panic!("Please report on GitHub. Unexpected closed sem, err={e}")
+            });
+        process_files(options.clone(), url, path).await;
+        options.n_active_requests.fetch_sub(1, Ordering::AcqRel);
+    });
+}
 
-                    process_files(
-                        options.clone(),
-                        folder.files_url.clone(),
-                        folder_path.clone(),
-                    )
-                    .await;
+async fn process_folders(options: Arc<ProcessOptions>, url: String, path: PathBuf) {
+    // Query and parse folders
+    let canvas_token = &options.canvas_token;
+    let folders_result = options
+        .client
+        .get(&url)
+        .bearer_auth(canvas_token)
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("Something went wrong when reaching {url}, err={e}"))
+        .json::<canvas::FolderResult>()
+        .await;
 
-                    process_folders(
-                        options.clone(),
-                        folder.folders_url.clone(),
-                        folder_path.clone(),
-                    )
-                    .await;
+    match folders_result {
+        Ok(canvas::FolderResult::Ok(folders)) => {
+            for folder in folders {
+                let sanitized_folder_name = sanitize_filename::sanitize(folder.name);
+                // if the folder has no parent, it is the root folder of a course
+                // so we avoid the extra directory nesting by not appending the root folder name
+                let folder_path = if folder.parent_folder_id.is_some() {
+                    path.clone().join(sanitized_folder_name)
+                } else {
+                    path.clone()
+                };
+                if !folder_path.exists() {
+                    std::fs::create_dir(&folder_path).unwrap_or_else(|e| {
+                        panic!(
+                            "Failed to create directory: {}, err={e}",
+                            folder_path.to_string_lossy()
+                        )
+                    });
                 }
-            }
-            Ok(canvas::FolderResult::Err { status }) => {
-                let course_has_no_folders = status == "unauthorized";
-                if !course_has_no_folders {
-                    println!(
-                        "Failed to access folders at link:{url}, path:{path:?}, status:{status}"
-                    );
-                }
-            }
-            Err(e) => {
-                println!("Failed to deserialize folders at link:{url}, path:{path:?}\n{e:?}");
+
+                spawn_process_files(
+                    options.clone(),
+                    folder.files_url.clone(),
+                    folder_path.clone(),
+                );
+                spawn_process_folders(
+                    options.clone(),
+                    folder.folders_url.clone(),
+                    folder_path.clone(),
+                );
             }
         }
+        Ok(canvas::FolderResult::Err { status }) => {
+            let course_has_no_folders = status == "unauthorized";
+            if !course_has_no_folders {
+                println!("Failed to access folders at link:{url}, path:{path:?}, status:{status}");
+            }
+        }
+        Err(e) => {
+            println!("Failed to deserialize folders at link:{url}, path:{path:?}\n{e:?}");
+        }
     }
-    .boxed()
 }
 
 async fn process_files(options: Arc<ProcessOptions>, url: String, path: PathBuf) {
@@ -493,7 +522,7 @@ mod canvas {
         pub client: reqwest::Client,
         pub download_newer: bool,
         pub files_to_download: Mutex<Vec<File>>,     // Output
-        pub concurrent_reqs: tokio::sync::Semaphore, // Limit concurrent requests
-        pub n_active_reqs: AtomicUsize,              // Main thread waits for this to be 0
+        pub request_permits: tokio::sync::Semaphore, // Limit concurrent requests
+        pub n_active_requests: AtomicUsize,          // Main thread waits for this to be 0
     }
 }
