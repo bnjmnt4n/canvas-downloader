@@ -14,7 +14,7 @@ use std::{
         Arc,
     },
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -53,14 +53,14 @@ async fn main() -> Result<()> {
         })
         .collect();
 
-    let options = ProcessOptions {
+    let options = Arc::new(ProcessOptions {
         canvas_token: cred.canvas_token.clone(),
-        link: String::from(""),
-        parent_folder_path: PathBuf::new(),
         client: client.clone(),
-        files_to_download: Arc::new(Mutex::new(Vec::new())),
+        files_to_download: Mutex::new(Vec::new()),
         download_newer: args.download_newer,
-    };
+        concurrent_reqs: Semaphore::new(num_cpus::get()),
+        n_active_reqs: AtomicUsize::new(0),
+    });
 
     println!("Courses found:");
     for course in courses {
@@ -84,11 +84,7 @@ async fn main() -> Result<()> {
             cred.canvas_url, course.id
         );
 
-        let mut new_options = options.clone();
-        new_options.link = course_folders_link;
-        new_options.parent_folder_path = course_folder_path;
-
-        process_folders(new_options).await;
+        process_folders(options.clone(), course_folders_link, course_folder_path).await;
     }
 
     println!();
@@ -295,21 +291,20 @@ fn parse_credentials(args: &CommandLineOptions) -> canvas::Credentials {
 }
 
 // async recursion needs boxing
-fn process_folders(options: ProcessOptions) -> BoxFuture<'static, ()> {
+fn process_folders(
+    options: Arc<ProcessOptions>,
+    url: String,
+    path: PathBuf,
+) -> BoxFuture<'static, ()> {
     async move {
         let canvas_token = &options.canvas_token;
         let folders_result = options
             .client
-            .get(&options.link)
+            .get(&url)
             .bearer_auth(canvas_token)
             .send()
             .await
-            .unwrap_or_else(|e| {
-                panic!(
-                    "Something went wrong when reaching {}, err={e}",
-                    &options.link
-                )
-            })
+            .unwrap_or_else(|e| panic!("Something went wrong when reaching {url}, err={e}"))
             .json::<canvas::FolderResult>()
             .await;
 
@@ -321,12 +316,9 @@ fn process_folders(options: ProcessOptions) -> BoxFuture<'static, ()> {
                     // if the folder has no parent, it is the root folder of a course
                     // so we avoid the extra directory nesting by not appending the root folder name
                     let folder_path = if folder.parent_folder_id.is_some() {
-                        options
-                            .parent_folder_path
-                            .clone()
-                            .join(sanitized_folder_name)
+                        path.clone().join(sanitized_folder_name)
                     } else {
-                        options.parent_folder_path.clone()
+                        path.clone()
                     };
                     if !folder_path.exists() {
                         std::fs::create_dir(&folder_path).unwrap_or_else(|e| {
@@ -337,54 +329,45 @@ fn process_folders(options: ProcessOptions) -> BoxFuture<'static, ()> {
                         });
                     }
 
-                    let mut new_options = options.clone();
-                    new_options.link = folder.files_url.clone();
-                    new_options.parent_folder_path = folder_path.clone();
-                    process_files(new_options).await;
+                    process_files(
+                        options.clone(),
+                        folder.files_url.clone(),
+                        folder_path.clone(),
+                    )
+                    .await;
 
-                    let mut new_options = options.clone();
-                    new_options.link = folder.folders_url.clone();
-                    new_options.parent_folder_path = folder_path.clone();
-                    process_folders(new_options).await;
+                    process_folders(
+                        options.clone(),
+                        folder.folders_url.clone(),
+                        folder_path.clone(),
+                    )
+                    .await;
                 }
             }
             Ok(canvas::FolderResult::Err { status }) => {
                 let course_has_no_folders = status == "unauthorized";
                 if !course_has_no_folders {
                     println!(
-                        "Failed to access folders at link:{}, path:{}, status:{}",
-                        options.link,
-                        options.parent_folder_path.to_string_lossy(),
-                        status
+                        "Failed to access folders at link:{url}, path:{path:?}, status:{status}"
                     );
                 }
             }
             Err(e) => {
-                println!(
-                    "Failed to deserialize folders at link:{}, path:{}\n{:?}",
-                    &options.link,
-                    &options.parent_folder_path.to_string_lossy(),
-                    e
-                );
+                println!("Failed to deserialize folders at link:{url}, path:{path:?}\n{e:?}");
             }
         }
     }
     .boxed()
 }
 
-async fn process_files(options: ProcessOptions) {
+async fn process_files(options: Arc<ProcessOptions>, url: String, path: PathBuf) {
     let files_result = options
         .client
-        .get(&options.link)
+        .get(&url)
         .bearer_auth(&options.canvas_token)
         .send()
         .await
-        .unwrap_or_else(|e| {
-            panic!(
-                "Something went wrong when reaching {}, err={e}",
-                &options.link
-            )
-        })
+        .unwrap_or_else(|e| panic!("Something went wrong when reaching {url}, err={e}"))
         .json::<canvas::FileResult>()
         .await;
 
@@ -406,7 +389,7 @@ async fn process_files(options: ProcessOptions) {
         Ok(canvas::FileResult::Ok(mut files)) => {
             for file in &mut files {
                 let sanitized_filename = sanitize_filename::sanitize(&file.display_name);
-                file.filepath = options.parent_folder_path.join(sanitized_filename);
+                file.filepath = path.join(sanitized_filename);
             }
 
             // only download files that do not exist or are updated
@@ -424,21 +407,11 @@ async fn process_files(options: ProcessOptions) {
         Ok(canvas::FileResult::Err { status }) => {
             let course_has_no_files = status == "unauthorized";
             if !course_has_no_files {
-                println!(
-                    "Failed to access files at link:{}, path:{}, status:{}",
-                    options.link,
-                    options.parent_folder_path.to_string_lossy(),
-                    status
-                );
+                println!("Failed to access files at link:{url}, path:{path:?}, status:{status}");
             }
         }
         Err(e) => {
-            println!(
-                "Failed to deserialize files at link:{}, path:{}\n{:?}",
-                &options.link,
-                &options.parent_folder_path.to_string_lossy(),
-                e
-            );
+            println!("Failed to deserialize files at link:{url}, path:{path:?}\n{e:?}");
         }
     };
 }
@@ -461,7 +434,7 @@ struct CommandLineOptions {
 
 mod canvas {
     use serde::{Deserialize, Serialize};
-    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
     use tokio::sync::Mutex;
 
     #[derive(Clone, Deserialize, Serialize)]
@@ -515,13 +488,12 @@ mod canvas {
         pub filepath: std::path::PathBuf,
     }
 
-    #[derive(Clone)]
     pub struct ProcessOptions {
         pub canvas_token: String,
         pub client: reqwest::Client,
-        pub link: String,
-        pub parent_folder_path: std::path::PathBuf,
-        pub files_to_download: Arc<Mutex<Vec<File>>>,
         pub download_newer: bool,
+        pub files_to_download: Mutex<Vec<File>>,     // Output
+        pub concurrent_reqs: tokio::sync::Semaphore, // Limit concurrent requests
+        pub n_active_reqs: AtomicUsize,              // Main thread waits for this to be 0
     }
 }
