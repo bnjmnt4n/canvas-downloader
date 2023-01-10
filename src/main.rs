@@ -28,9 +28,8 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|e| panic!("Failed to create destination directory, err={e}"));
     }
 
-    let courses_link = format!("{}/api/v1/courses", cred.canvas_url);
-
     let client = reqwest::Client::new();
+    let courses_link = format!("{}/api/v1/users/self/favorites/courses", cred.canvas_url);
 
     // Get courses
     let courses: Vec<canvas::Course> = client
@@ -80,7 +79,10 @@ async fn main() -> Result<()> {
         }
 
         // this api gives us the root folder
-        let course_folders_link = format!("{}/{}/folders/by_path/", &courses_link, course.id);
+        let course_folders_link = format!(
+            "{}/api/v1/courses/{}/folders/by_path/",
+            cred.canvas_url, course.id
+        );
 
         let mut new_options = options.clone();
         new_options.link = course_folders_link;
