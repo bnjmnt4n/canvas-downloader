@@ -1,3 +1,5 @@
+#![deny(clippy::unwrap_used)]
+
 use anyhow::{Context, Result};
 use canvas::ProcessOptions;
 use chrono::DateTime;
@@ -5,93 +7,54 @@ use clap::Parser;
 use futures::{future::BoxFuture, FutureExt};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::header;
-use std::{sync::{Arc, atomic::{AtomicUsize, Ordering}}, path::PathBuf};
+use std::{
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
 use tokio::sync::Mutex;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = CommandLineOptions::parse();
 
-    if (args.canvas_url.is_none() || args.canvas_token.is_none()) && args.canvas_credential_path.is_none() {
-        panic!("Provide canvas url and token via -u and -t respectively or via a credential file -c");
-    }
+    let cred = parse_credentials(&args);
 
+    // Create sub-folder if not exists
     if !args.destination_folder.exists() {
         std::fs::create_dir(&args.destination_folder)
-            .with_context(|| format!("Failed to create directory: {}", args.destination_folder.to_string_lossy()))?;
-    }
-
-    let credentials: Option<canvas::Credentials> = if args.canvas_credential_path.is_some() {
-        let path = args.canvas_credential_path.clone().unwrap();
-
-        if !path.exists() {
-            if !args.save_credentials {
-                panic!("The given path to the credentials file does not exists");
-            } else {
-                Option::None
-            }
-        } else {
-            if !args.save_credentials {
-                let file = std::fs::File::open(path)?;
-                serde_json::from_reader(file).expect("Credential file is not valid json")
-            } else {
-                Option::None
-            }
-        }
-    } else {
-        Option::None
-    };
-
-    let canvas_url = if args.canvas_url.is_some() {
-        args.canvas_url.unwrap()
-    } else {
-        credentials.clone().unwrap().canvas_url
-    };
-
-    let canvas_token = if args.canvas_token.is_some() {
-        args.canvas_token.unwrap()
-    } else {
-        credentials.clone().unwrap().canvas_token
-    };
-
-    if args.save_credentials {
-        if args.canvas_credential_path.is_none() {
-            panic!("Provide the destination path to save the credential to");
-        }
-
-        let path = args.canvas_credential_path.clone().unwrap();
-        let file = std::fs::File::create(path)?;
-        let credentials = canvas::Credentials {
-            canvas_url: canvas_url.clone(),
-            canvas_token: canvas_token.clone(),
-        };
-        serde_json::to_writer_pretty(file, &credentials)?;
+            .unwrap_or_else(|e| panic!("Failed to create destination directory, err={e}"));
     }
 
     let client = reqwest::Client::new();
+    let courses_link = format!("{}/api/v1/users/self/favorites/courses", cred.canvas_url);
 
-    // do not directly deserialize into canvas::Course objects
-    // there are may be courses that are restricted and not contain the fields needed to deserialise
-    let courses_link = format!("{}/api/v1/users/self/favorites/courses", canvas_url);
-    let courses_json = client
+    // Get courses
+    let courses: Vec<canvas::Course> = client
+        // GET request
         .get(&courses_link)
-        .bearer_auth(&canvas_token)
+        .bearer_auth(&cred.canvas_token)
         .send()
         .await
-        .with_context(|| format!("Something went wrong when reaching {}", &courses_link))?
-        .json::<serde_json::Value>()
-        .await?;
-
-    let mut courses = vec![];
-    for course_json in courses_json.as_array().unwrap() {
-        if course_json.get("enrollments").is_some() {
-            let course: canvas::Course = serde_json::from_value(course_json.to_owned()).unwrap();
-            courses.push(course);
-        }
-    }
+        .unwrap_or_else(|e| panic!("Something went wrong when reaching {courses_link}, err={e}"))
+        // Parse json
+        .json::<Vec<serde_json::Value>>()
+        .await?
+        // Filter valid courses
+        .into_iter()
+        .filter_map(|course_json| {
+            course_json.get("enrollments").and_then(|_| {
+                serde_json::from_value(course_json.clone()).unwrap_or_else(|e| {
+                    panic!("Could not parse course with json={course_json}, err={e}")
+                })
+            })
+        })
+        .collect();
 
     let options = ProcessOptions {
-        canvas_token: canvas_token.clone(),
+        canvas_token: cred.canvas_token.clone(),
         link: String::from(""),
         parent_folder_path: PathBuf::new(),
         client: client.clone(),
@@ -105,7 +68,7 @@ async fn main() -> Result<()> {
 
         let course_folder_path = args
             .destination_folder
-            .join(course.course_code.replace("/", "_"));
+            .join(course.course_code.replace('/', "_"));
         if !course_folder_path.exists() {
             std::fs::create_dir(&course_folder_path).with_context(|| {
                 format!(
@@ -118,7 +81,7 @@ async fn main() -> Result<()> {
         // this api gives us the root folder
         let course_folders_link = format!(
             "{}/api/v1/courses/{}/folders/by_path/",
-            canvas_url, course.id
+            cred.canvas_url, course.id
         );
 
         let mut new_options = options.clone();
@@ -128,16 +91,24 @@ async fn main() -> Result<()> {
         process_folders(new_options).await;
     }
 
-    println!("");
+    println!();
 
     // Tokio uses the number of cpus as num of work threads in the default runtime
     let num_worker_threads = num_cpus::get();
-    let files_to_download = Arc::new(Arc::try_unwrap(options.files_to_download).unwrap().into_inner());
+    let files_to_download = Arc::new(options.files_to_download.lock().await.clone());
     let num_worker_extra_work = files_to_download.len() % num_worker_threads;
     let min_work = files_to_download.len() / num_worker_threads;
     let progress_bars = Arc::new(MultiProgress::new());
 
-    println!("Downloading {} file{}", files_to_download.len(), if files_to_download.len() == 1 { "" } else { "s" } );
+    println!(
+        "Downloading {} file{}",
+        files_to_download.len(),
+        if files_to_download.len() == 1 {
+            ""
+        } else {
+            "s"
+        }
+    );
 
     let mut join_handles = Vec::new();
     let atomic_file_index = Arc::new(AtomicUsize::new(0));
@@ -149,7 +120,7 @@ async fn main() -> Result<()> {
         if i < num_worker_extra_work {
             work += 1;
         }
-        let canvas_token = canvas_token.clone();
+        let canvas_token = cred.canvas_token.clone();
         let client = client.clone();
         let files_to_download = files_to_download.clone();
         let progress_bars = progress_bars.clone();
@@ -157,12 +128,23 @@ async fn main() -> Result<()> {
         let handle = tokio::spawn(async move {
             for _ in 0..work {
                 let file_index = atomic_file_index.fetch_add(1, Ordering::Relaxed);
-                let canvas_file = files_to_download.get(file_index).unwrap();
+                let canvas_file = files_to_download.get(file_index).expect(
+                    "Please report this issue on GitHub: downloading file with index out of bounds",
+                );
 
                 // We need to determine the file size before we download, so we can create a ProgressBar
                 // A Header request for the CONTENT_LENGTH header gets us the file size
                 let download_size = {
-                    let resp = client.head(&canvas_file.url).send().await.unwrap();
+                    let resp = client
+                        .head(&canvas_file.url)
+                        .send()
+                        .await
+                        .unwrap_or_else(|e| {
+                            panic!(
+                                "Unable to get file information for {:?}, err={e}",
+                                canvas_file
+                            )
+                        });
                     if resp.status().is_success() {
                         resp.headers() // Gives us the HeaderMap
                             .get(header::CONTENT_LENGTH) // Gives us an Option containing the HeaderValue
@@ -172,67 +154,91 @@ async fn main() -> Result<()> {
                     } else {
                         // We return an Error if something goes wrong here
                         println!("Failed to download {}", canvas_file.display_name);
-                        continue
+                        continue;
                     }
                 };
 
                 let progress_bar = progress_bars.add(ProgressBar::new(download_size));
 
-                let mut style_template = "[{bar:20.cyan/blue}] {bytes}/{total_bytes} - {bytes_per_sec} - {msg}";
-                termsize::get().map(|size| {
-                    // arbitrary 100
-                    if size.cols < 100 {
-                        style_template = "[{wide_bar:.cyan/blue}] {total_bytes} - {msg}";
-                    }
-                });
+                let style_template = if termsize::get().map_or(false, |size| size.cols < 100) {
+                    "[{wide_bar:.cyan/blue}] {total_bytes} - {msg}"
+                } else {
+                    "[{bar:20.cyan/blue}] {bytes}/{total_bytes} - {bytes_per_sec} - {msg}"
+                };
                 progress_bar.set_style(
                     ProgressStyle::default_bar()
-                        .template(style_template).unwrap()
-                        .progress_chars("=>-")
+                        .template(style_template)
+                        .unwrap_or_else(|e| panic!("Please report this issue on GitHub: error with progress bar style={style_template}, err={e}"))
+                        .progress_chars("=>-"),
                 );
 
-                let message = format!("{}", canvas_file.display_name);
+                let message = canvas_file.display_name.to_string();
 
                 progress_bar.set_message(message);
 
-                let mut file = std::fs::File::create(&canvas_file.filepath).unwrap();
+                let mut file = std::fs::File::create(&canvas_file.filepath).unwrap_or_else(|e| {
+                    panic!(
+                        "Unable to create file={:?} with err={e}",
+                        canvas_file.filepath
+                    )
+                });
                 // canvas also provides a modified_time of the file but updated_at should be more proper
                 // as it probably represents the upload date of the file which is more apt for determining
                 // if the file was changed since downloading it
                 match DateTime::parse_from_rfc3339(&canvas_file.updated_at) {
                     Ok(updated_at) => {
-                        match filetime::set_file_mtime(
+                        if filetime::set_file_mtime(
                             &canvas_file.filepath,
                             filetime::FileTime::from_unix_time(
                                 updated_at.timestamp(),
-                                updated_at.timestamp_subsec_nanos())) {
-                            Err(_) => {
-                                println!("Failed to set modified time of {} with updated_at of {}", canvas_file.display_name, canvas_file.updated_at);
-                            },
-                            _ => {}
+                                updated_at.timestamp_subsec_nanos(),
+                            ),
+                        )
+                        .is_err()
+                        {
+                            println!(
+                                "Failed to set modified time of {} with updated_at of {}",
+                                canvas_file.display_name, canvas_file.updated_at
+                            );
                         };
-                    },
+                    }
                     Err(_) => {
-                        println!("Failed to parse updated_at time for {}, {}", canvas_file.display_name, canvas_file.updated_at);
+                        println!(
+                            "Failed to parse updated_at time for {}, {}",
+                            canvas_file.display_name, canvas_file.updated_at
+                        );
                         continue;
                     }
                 };
 
-                let mut file_response = client.get(&canvas_file.url)
+                let mut file_response = client
+                    .get(&canvas_file.url)
                     .bearer_auth(&canvas_token)
                     .send()
                     .await
-                    .with_context(|| format!("Something went wrong when reaching {}", &canvas_file.url)).unwrap();
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "Something went wrong when reaching {}, err={e}",
+                            canvas_file.url
+                        )
+                    });
 
-                while let Some(chunk) = file_response.chunk().await.unwrap() {
+                while let Some(chunk) = file_response.chunk().await.unwrap_or_else(|e| {
+                    panic!(
+                        "Something went wrong downloading {}, err={e}",
+                        canvas_file.url
+                    )
+                }) {
                     progress_bar.inc(chunk.len() as u64);
                     let mut cursor = std::io::Cursor::new(chunk);
-                    std::io::copy(&mut cursor, &mut file).unwrap();
+                    std::io::copy(&mut cursor, &mut file).unwrap_or_else(|e| {
+                        panic!("Could not save file {:?}, err={e}", canvas_file.filepath)
+                    });
                 }
                 progress_bar.finish();
             }
         });
-        
+
         join_handles.push(handle);
     }
 
@@ -240,25 +246,73 @@ async fn main() -> Result<()> {
         handle.await?;
     }
 
-    for canvas_file in Arc::try_unwrap(files_to_download).unwrap() {
-        println!("Downloaded {} to {}", canvas_file.display_name, canvas_file.filepath.to_string_lossy());
+    for canvas_file in files_to_download.iter() {
+        println!(
+            "Downloaded {} to {}",
+            canvas_file.display_name,
+            canvas_file.filepath.to_string_lossy()
+        );
     }
 
     Ok(())
+}
+
+fn parse_credentials(args: &CommandLineOptions) -> canvas::Credentials {
+    // Parse...
+    let cred = if let (Some(url), Some(token)) = (&args.canvas_url, &args.canvas_token) {
+        // ...from CLI
+        canvas::Credentials {
+            canvas_url: url.clone(),
+            canvas_token: token.clone(),
+        }
+    } else if let Some(path) = &args.canvas_credential_path {
+        // ...from file
+        assert!(
+            !args.save_credentials,
+            "To save credentials, please provide url and token via -u and -t respectively"
+        );
+        let file = std::fs::File::open(path)
+            .unwrap_or_else(|e| panic!("Could not open credential file, err={e}"));
+        serde_json::from_reader(file).expect("Credential file is not valid json")
+    } else {
+        panic!(
+            "Provide canvas url and token via -u and -t respectively or via a credential file -c"
+        );
+    };
+
+    // Save credentials
+    if args.save_credentials {
+        let Some(path) = &args.canvas_credential_path else {
+            panic!("To save credentials, please provide credential file via -c");
+        };
+        let file = std::fs::File::create(path)
+            .unwrap_or_else(|e| panic!("Could not open credential file, err={e}"));
+        serde_json::to_writer_pretty(file, &cred)
+            .unwrap_or_else(|e| panic!("Could not write credential file, err={e}"));
+    }
+
+    cred
 }
 
 // async recursion needs boxing
 fn process_folders(options: ProcessOptions) -> BoxFuture<'static, ()> {
     async move {
         let canvas_token = &options.canvas_token;
-        let folders_result = options.client.get(&options.link)
-            .bearer_auth(&canvas_token)
+        let folders_result = options
+            .client
+            .get(&options.link)
+            .bearer_auth(canvas_token)
             .send()
             .await
-            .with_context(|| format!("Something went wrong when reaching {}", &options.link)).unwrap()
+            .unwrap_or_else(|e| {
+                panic!(
+                    "Something went wrong when reaching {}, err={e}",
+                    &options.link
+                )
+            })
             .json::<canvas::FolderResult>()
             .await;
-        
+
         match folders_result {
             Ok(canvas::FolderResult::Ok(folders)) => {
                 for folder in folders {
@@ -267,83 +321,124 @@ fn process_folders(options: ProcessOptions) -> BoxFuture<'static, ()> {
                     // if the folder has no parent, it is the root folder of a course
                     // so we avoid the extra directory nesting by not appending the root folder name
                     let folder_path = if folder.parent_folder_id.is_some() {
-                        options.parent_folder_path.clone().join(sanitized_folder_name)
+                        options
+                            .parent_folder_path
+                            .clone()
+                            .join(sanitized_folder_name)
                     } else {
                         options.parent_folder_path.clone()
                     };
                     if !folder_path.exists() {
-                        std::fs::create_dir(&folder_path)
-                            .with_context(|| format!("Failed to create directory: {}", folder_path.to_string_lossy())).unwrap();
+                        std::fs::create_dir(&folder_path).unwrap_or_else(|e| {
+                            panic!(
+                                "Failed to create directory: {}, err={e}",
+                                folder_path.to_string_lossy()
+                            )
+                        });
                     }
 
                     let mut new_options = options.clone();
                     new_options.link = folder.files_url.clone();
                     new_options.parent_folder_path = folder_path.clone();
                     process_files(new_options).await;
-        
+
                     let mut new_options = options.clone();
                     new_options.link = folder.folders_url.clone();
                     new_options.parent_folder_path = folder_path.clone();
                     process_folders(new_options).await;
                 }
-            },
-            Ok(canvas::FolderResult::Err{status}) => {
+            }
+            Ok(canvas::FolderResult::Err { status }) => {
                 let course_has_no_folders = status == "unauthorized";
                 if !course_has_no_folders {
-                    println!("Failed to access folders at link:{}, path:{}, status:{}", options.link, options.parent_folder_path.to_string_lossy(), status);
+                    println!(
+                        "Failed to access folders at link:{}, path:{}, status:{}",
+                        options.link,
+                        options.parent_folder_path.to_string_lossy(),
+                        status
+                    );
                 }
-            },
+            }
             Err(e) => {
-                println!("Failed to deserialize folders at link:{}, path:{}\n{:?}", &options.link, &options.parent_folder_path.to_string_lossy(), e);
+                println!(
+                    "Failed to deserialize folders at link:{}, path:{}\n{:?}",
+                    &options.link,
+                    &options.parent_folder_path.to_string_lossy(),
+                    e
+                );
             }
         }
-    }.boxed()
+    }
+    .boxed()
 }
 
 async fn process_files(options: ProcessOptions) {
-    let files_result = options.client.get(&options.link)
+    let files_result = options
+        .client
+        .get(&options.link)
         .bearer_auth(&options.canvas_token)
         .send()
         .await
-        .with_context(|| format!("Something went wrong when reaching {}", &options.link)).unwrap()
+        .unwrap_or_else(|e| {
+            panic!(
+                "Something went wrong when reaching {}, err={e}",
+                &options.link
+            )
+        })
         .json::<canvas::FileResult>()
         .await;
-    
+
     fn updated(filepath: &PathBuf, new_modified: &str) -> bool {
         (|| -> Result<bool> {
             let old_modified = std::fs::metadata(filepath)?.modified()?;
-            let new_modified = std::time::SystemTime::from(DateTime::parse_from_rfc3339(new_modified)?);
+            let new_modified =
+                std::time::SystemTime::from(DateTime::parse_from_rfc3339(new_modified)?);
             let updated = old_modified < new_modified;
             if updated {
                 println!("Found update for {filepath:?}. Use -n to download updated files.");
             }
             Ok(updated)
-        })().unwrap_or(false)
+        })()
+        .unwrap_or(false)
     }
-    
+
     match files_result {
         Ok(canvas::FileResult::Ok(mut files)) => {
             for file in &mut files {
                 let sanitized_filename = sanitize_filename::sanitize(&file.display_name);
                 file.filepath = options.parent_folder_path.join(sanitized_filename);
             }
-            
+
             // only download files that do not exist or are updated
-            let mut filtered_files = files.into_iter()
-            .filter(|f| !f.filepath.exists() || (updated(&f.filepath, &f.updated_at)) && options.download_newer)
-            .collect::<Vec<canvas::File>>();
-            
+            let mut filtered_files = files
+                .into_iter()
+                .filter(|f| {
+                    !f.filepath.exists()
+                        || (updated(&f.filepath, &f.updated_at)) && options.download_newer
+                })
+                .collect::<Vec<canvas::File>>();
+
             let mut lock = options.files_to_download.lock().await;
             lock.append(&mut filtered_files);
-        },
+        }
         Ok(canvas::FileResult::Err { status }) => {
             let course_has_no_files = status == "unauthorized";
             if !course_has_no_files {
-                println!("Failed to access files at link:{}, path:{}, status:{}", options.link, options.parent_folder_path.to_string_lossy(), status);
+                println!(
+                    "Failed to access files at link:{}, path:{}, status:{}",
+                    options.link,
+                    options.parent_folder_path.to_string_lossy(),
+                    status
+                );
             }
         }
         Err(e) => {
-            println!("Failed to deserialize files at link:{}, path:{}\n{:?}", &options.link, &options.parent_folder_path.to_string_lossy(), e);
+            println!(
+                "Failed to deserialize files at link:{}, path:{}\n{:?}",
+                &options.link,
+                &options.parent_folder_path.to_string_lossy(),
+                e
+            );
         }
     };
 }
@@ -355,9 +450,9 @@ struct CommandLineOptions {
     #[clap(short = 't', long, forbid_empty_values = true)]
     canvas_token: Option<String>,
     #[clap(short = 'c', long, parse(from_os_str), forbid_empty_values = true)]
-    canvas_credential_path: Option<std::path::PathBuf>,
+    canvas_credential_path: Option<PathBuf>,
     #[clap(short = 'd', long, parse(from_os_str), default_value = ".")]
-    destination_folder: std::path::PathBuf,
+    destination_folder: PathBuf,
     #[clap(short = 's', long, takes_value = false)]
     save_credentials: bool,
     #[clap(short = 'n', long, takes_value = false)]
@@ -389,7 +484,7 @@ mod canvas {
         Err { status: String },
         Ok(Vec<Folder>),
     }
-    
+
     #[derive(Deserialize)]
     pub struct Folder {
         pub id: u32,
