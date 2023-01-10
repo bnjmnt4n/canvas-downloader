@@ -1,3 +1,5 @@
+#![deny(clippy::unwrap_used)]
+
 use anyhow::{Context, Result};
 use canvas::ProcessOptions;
 use chrono::DateTime;
@@ -22,12 +24,8 @@ async fn main() -> Result<()> {
 
     // Create sub-folder if not exists
     if !args.destination_folder.exists() {
-        std::fs::create_dir(&args.destination_folder).with_context(|| {
-            format!(
-                "Failed to create directory: {}",
-                args.destination_folder.to_string_lossy()
-            )
-        })?;
+        std::fs::create_dir(&args.destination_folder)
+            .unwrap_or_else(|e| panic!("Failed to create destination directory, err={e}"));
     }
 
     let courses_link = format!("{}/api/v1/courses", cred.canvas_url);
@@ -71,7 +69,7 @@ async fn main() -> Result<()> {
 
         let course_folder_path = args
             .destination_folder
-            .join(course.course_code.replace("/", "_"));
+            .join(course.course_code.replace('/', "_"));
         if !course_folder_path.exists() {
             std::fs::create_dir(&course_folder_path).with_context(|| {
                 format!(
@@ -95,11 +93,7 @@ async fn main() -> Result<()> {
 
     // Tokio uses the number of cpus as num of work threads in the default runtime
     let num_worker_threads = num_cpus::get();
-    let files_to_download = Arc::new(
-        Arc::try_unwrap(options.files_to_download)
-            .unwrap()
-            .into_inner(),
-    );
+    let files_to_download = Arc::new(options.files_to_download.lock().await.clone());
     let num_worker_extra_work = files_to_download.len() % num_worker_threads;
     let min_work = files_to_download.len() / num_worker_threads;
     let progress_bars = Arc::new(MultiProgress::new());
@@ -132,12 +126,23 @@ async fn main() -> Result<()> {
         let handle = tokio::spawn(async move {
             for _ in 0..work {
                 let file_index = atomic_file_index.fetch_add(1, Ordering::Relaxed);
-                let canvas_file = files_to_download.get(file_index).unwrap();
+                let canvas_file = files_to_download.get(file_index).expect(
+                    "Please report this issue on GitHub: downloading file with index out of bounds",
+                );
 
                 // We need to determine the file size before we download, so we can create a ProgressBar
                 // A Header request for the CONTENT_LENGTH header gets us the file size
                 let download_size = {
-                    let resp = client.head(&canvas_file.url).send().await.unwrap();
+                    let resp = client
+                        .head(&canvas_file.url)
+                        .send()
+                        .await
+                        .unwrap_or_else(|e| {
+                            panic!(
+                                "Unable to get file information for {:?}, err={e}",
+                                canvas_file
+                            )
+                        });
                     if resp.status().is_success() {
                         resp.headers() // Gives us the HeaderMap
                             .get(header::CONTENT_LENGTH) // Gives us an Option containing the HeaderValue
@@ -161,7 +166,7 @@ async fn main() -> Result<()> {
                 progress_bar.set_style(
                     ProgressStyle::default_bar()
                         .template(style_template)
-                        .unwrap()
+                        .unwrap_or_else(|e| panic!("Please report this issue on GitHub: error with progress bar style={style_template}, err={e}"))
                         .progress_chars("=>-"),
                 );
 
@@ -169,7 +174,12 @@ async fn main() -> Result<()> {
 
                 progress_bar.set_message(message);
 
-                let mut file = std::fs::File::create(&canvas_file.filepath).unwrap();
+                let mut file = std::fs::File::create(&canvas_file.filepath).unwrap_or_else(|e| {
+                    panic!(
+                        "Unable to create file={:?} with err={e}",
+                        canvas_file.filepath
+                    )
+                });
                 // canvas also provides a modified_time of the file but updated_at should be more proper
                 // as it probably represents the upload date of the file which is more apt for determining
                 // if the file was changed since downloading it
@@ -204,15 +214,24 @@ async fn main() -> Result<()> {
                     .bearer_auth(&canvas_token)
                     .send()
                     .await
-                    .with_context(|| {
-                        format!("Something went wrong when reaching {}", &canvas_file.url)
-                    })
-                    .unwrap();
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "Something went wrong when reaching {}, err={e}",
+                            canvas_file.url
+                        )
+                    });
 
-                while let Some(chunk) = file_response.chunk().await.unwrap() {
+                while let Some(chunk) = file_response.chunk().await.unwrap_or_else(|e| {
+                    panic!(
+                        "Something went wrong downloading {}, err={e}",
+                        canvas_file.url
+                    )
+                }) {
                     progress_bar.inc(chunk.len() as u64);
                     let mut cursor = std::io::Cursor::new(chunk);
-                    std::io::copy(&mut cursor, &mut file).unwrap();
+                    std::io::copy(&mut cursor, &mut file).unwrap_or_else(|e| {
+                        panic!("Could not save file {:?}, err={e}", canvas_file.filepath)
+                    });
                 }
                 progress_bar.finish();
             }
@@ -225,7 +244,7 @@ async fn main() -> Result<()> {
         handle.await?;
     }
 
-    for canvas_file in Arc::try_unwrap(files_to_download).unwrap() {
+    for canvas_file in files_to_download.iter() {
         println!(
             "Downloaded {} to {}",
             canvas_file.display_name,
@@ -283,8 +302,12 @@ fn process_folders(options: ProcessOptions) -> BoxFuture<'static, ()> {
             .bearer_auth(canvas_token)
             .send()
             .await
-            .with_context(|| format!("Something went wrong when reaching {}", &options.link))
-            .unwrap()
+            .unwrap_or_else(|e| {
+                panic!(
+                    "Something went wrong when reaching {}, err={e}",
+                    &options.link
+                )
+            })
             .json::<canvas::FolderResult>()
             .await;
 
@@ -304,14 +327,12 @@ fn process_folders(options: ProcessOptions) -> BoxFuture<'static, ()> {
                         options.parent_folder_path.clone()
                     };
                     if !folder_path.exists() {
-                        std::fs::create_dir(&folder_path)
-                            .with_context(|| {
-                                format!(
-                                    "Failed to create directory: {}",
-                                    folder_path.to_string_lossy()
-                                )
-                            })
-                            .unwrap();
+                        std::fs::create_dir(&folder_path).unwrap_or_else(|e| {
+                            panic!(
+                                "Failed to create directory: {}, err={e}",
+                                folder_path.to_string_lossy()
+                            )
+                        });
                     }
 
                     let mut new_options = options.clone();
@@ -356,8 +377,12 @@ async fn process_files(options: ProcessOptions) {
         .bearer_auth(&options.canvas_token)
         .send()
         .await
-        .with_context(|| format!("Something went wrong when reaching {}", &options.link))
-        .unwrap()
+        .unwrap_or_else(|e| {
+            panic!(
+                "Something went wrong when reaching {}, err={e}",
+                &options.link
+            )
+        })
         .json::<canvas::FileResult>()
         .await;
 
