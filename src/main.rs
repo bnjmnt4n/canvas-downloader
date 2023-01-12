@@ -107,15 +107,11 @@ async fn main() -> Result<()> {
             break;
         }
     }
-    // Sanity check: since there are no running tasks, main() should be the only reference
-    let options = Arc::try_unwrap(options).unwrap_or_else(|e| {
-        panic!("Please report on GitHub. Main should be sole reference, err={e:?}")
-    });
     println!();
 
     // Tokio uses the number of cpus as num of work threads in the default runtime
     let num_worker_threads = num_cpus::get();
-    let files_to_download = Arc::new(options.files_to_download.into_inner());
+    let files_to_download = Arc::new(options.files_to_download.lock().await.clone());
     let num_worker_extra_work = files_to_download.len() % num_worker_threads;
     let min_work = files_to_download.len() / num_worker_threads;
     let progress_bars = Arc::new(MultiProgress::new());
