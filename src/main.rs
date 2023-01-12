@@ -412,6 +412,7 @@ async fn process_files(options: ProcessOptions) {
             // only download files that do not exist or are updated
             let mut filtered_files = files
                 .into_iter()
+                .filter(|f| !f.locked_for_user)
                 .filter(|f| {
                     !f.filepath.exists()
                         || (updated(&f.filepath, &f.updated_at)) && options.download_newer
@@ -511,6 +512,7 @@ mod canvas {
         pub size: u64,
         pub url: String,
         pub updated_at: String,
+        pub locked_for_user: bool,
         #[serde(skip)]
         pub filepath: std::path::PathBuf,
     }
