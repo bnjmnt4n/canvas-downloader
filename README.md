@@ -30,4 +30,5 @@ Downloads files from all courses in canvas.
     - e.g. command: `./canvas-downloader -d ~/courses -c ~/credentials.json`
 - Recommended to alias the command to use `-u` and `-t`, or `-c` to avoid typing so much
 - The downloader will not download the file if there is already a file at where it should be saved to
-    - If you want the new version, you need to delete the existing file (or rename it) so that the downloader will download the new verison
+    - If you want the new version, you need to use the `-n` flag
+- By default, the downloader will download all active courses, even from previous terms. Use the `-i` flag with a specific term_id to choose a specific enrollment month (`120` for Jan 2023, for example - this number increments every month).

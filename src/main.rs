@@ -51,6 +51,11 @@ async fn main() -> Result<()> {
                 })
             })
         })
+        .filter(|course_json: &canvas::Course| {
+            !args.enrollment_term_id.is_some() || (args.enrollment_term_id.unwrap_or_else(|| {
+                panic!("Invalid enrollment term id provided")
+            }) == (*course_json).enrollment_term_id)
+        })
         .collect();
 
     let options = ProcessOptions {
@@ -457,6 +462,8 @@ struct CommandLineOptions {
     save_credentials: bool,
     #[clap(short = 'n', long, takes_value = false)]
     download_newer: bool,
+    #[clap(short = 'i', long)]
+    enrollment_term_id: Option<u32>,
 }
 
 mod canvas {
@@ -476,6 +483,7 @@ mod canvas {
         pub id: u32,
         pub name: String,
         pub course_code: String,
+        pub enrollment_term_id: u32,
     }
 
     #[derive(Deserialize)]
