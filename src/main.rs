@@ -30,39 +30,36 @@ async fn main() -> Result<()> {
 
     let client = reqwest::Client::new();
     let courses_link = format!("{}/api/v1/users/self/favorites/courses", cred.canvas_url);
-
-    // Get courses
-    let courses: Vec<canvas::Course> = client
-        // GET request
-        .get(&courses_link)
-        .bearer_auth(&cred.canvas_token)
-        .send()
-        .await
-        .unwrap_or_else(|e| panic!("Something went wrong when reaching {courses_link}, err={e}"))
-        // Parse json
-        .json::<Vec<serde_json::Value>>()
-        .await?
-        // Filter valid courses
-        .into_iter()
-        .filter_map(|course_json| {
-            course_json.get("enrollments").and_then(|_| {
-                serde_json::from_value(course_json.clone()).unwrap_or_else(|e| {
-                    panic!("Could not parse course with json={course_json}, err={e}")
-                })
-            })
-        })
-        .collect();
-
-    let options = ProcessOptions {
+    let mut options = ProcessOptions {
         canvas_token: cred.canvas_token.clone(),
-        link: String::from(""),
+        link: courses_link,
         parent_folder_path: PathBuf::new(),
         client: client.clone(),
         files_to_download: Arc::new(Mutex::new(Vec::new())),
         download_newer: args.download_newer,
     };
 
+    // Get courses
+    let courses: Vec<canvas::Course> =
+        // Get and parse json
+        futures::future::join_all(get_pages(&options).await.into_iter().map(|resp| async {
+            resp.json::<Vec<serde_json::Value>>()
+                .await
+                .unwrap_or_else(|e| panic!("Failed to parse courses, err={e}"))
+        }))
+        .await
+        .into_iter()
+        // Filter and parse courses
+        .flat_map(|course|
+            course.into_iter().filter_map(|course_json|
+                course_json.get("enrollments").and_then(|_|
+                    serde_json::from_value(course_json.clone()).unwrap_or_else(|e| {
+                        panic!("Could not parse course with json={course_json}, err={e}")
+                    }))))
+        .collect();
+
     println!("Courses found:");
+    options.link.clear();
     for course in courses {
         println!("  * {} - {}", course.course_code, course.name);
 
@@ -295,24 +292,14 @@ fn parse_credentials(args: &CommandLineOptions) -> canvas::Credentials {
 }
 
 // async recursion needs boxing
-fn process_folders(mut options: ProcessOptions) -> BoxFuture<'static, ()> {
+fn process_folders(options: ProcessOptions) -> BoxFuture<'static, ()> {
     async move {
-        let mut link = Some(std::mem::take(&mut options.link));
+        let pages = get_pages(&options).await;
 
         // For each page
-        while let Some(uri) = link {
-            // GET request
-            let resp = options
-                .client
-                .get(&uri)
-                .bearer_auth(&options.canvas_token)
-                .send()
-                .await
-                .unwrap_or_else(|e| panic!("Something went wrong when reaching {}, err={e}", uri));
-
-            // Handle pagination before parsing json
-            link = get_next_page(&resp);
-            let folders_result = resp.json::<canvas::FolderResult>().await;
+        for pg in pages {
+            let uri = pg.url().to_string();
+            let folders_result = pg.json::<canvas::FolderResult>().await;
 
             match folders_result {
                 // Got folders
@@ -379,23 +366,13 @@ fn process_folders(mut options: ProcessOptions) -> BoxFuture<'static, ()> {
     .boxed()
 }
 
-async fn process_files(mut options: ProcessOptions) {
-    let mut link = Some(std::mem::take(&mut options.link));
+async fn process_files(options: ProcessOptions) {
+    let pages = get_pages(&options).await;
 
     // For each page
-    while let Some(uri) = link {
-        // GET request
-        let resp = options
-            .client
-            .get(&uri)
-            .bearer_auth(&options.canvas_token)
-            .send()
-            .await
-            .unwrap_or_else(|e| panic!("Something went wrong when reaching {}, err={e}", uri));
-
-        // Handle pagination before parsing json
-        link = get_next_page(&resp);
-        let files_result = resp.json::<canvas::FileResult>().await;
+    for pg in pages {
+        let uri = pg.url().to_string();
+        let files_result = pg.json::<canvas::FileResult>().await;
 
         match files_result {
             // Got files
@@ -461,30 +438,52 @@ fn filter_files(options: &ProcessOptions, files: Vec<canvas::File>) -> Vec<canva
         .collect::<Vec<canvas::File>>()
 }
 
-fn get_next_page(rsp: &Response) -> Option<String> {
-    // Parse LINK header
-    let links = rsp.headers().get(header::LINK)?.to_str().ok()?; // ok to not have LINK header
-    let rels = parse_link_header::parse_with_rel(links).unwrap_or_else(|e| {
-        panic!(
-            "Error parsing header for next page, uri={}, err={e:?}",
-            rsp.url()
-        )
-    });
+async fn get_pages(options: &ProcessOptions) -> Vec<Response> {
+    fn parse_next_page(resp: &Response) -> Option<String> {
+        // Parse LINK header
+        let links = resp.headers().get(header::LINK)?.to_str().ok()?; // ok to not have LINK header
+        let rels = parse_link_header::parse_with_rel(links).unwrap_or_else(|e| {
+            panic!(
+                "Error parsing header for next page, uri={}, err={e:?}",
+                resp.url()
+            )
+        });
 
-    // Is last page?
-    let nex = rels.get("next")?; // ok to not have "next"
-    let cur = rels
-        .get("current")
-        .unwrap_or_else(|| panic!("Could not find current page for {}", rsp.url()));
-    let last = rels
-        .get("last")
-        .unwrap_or_else(|| panic!("Could not find last page for {}", rsp.url()));
-    if cur == last {
-        return None;
-    };
+        // Is last page?
+        let nex = rels.get("next")?; // ok to not have "next"
+        let cur = rels
+            .get("current")
+            .unwrap_or_else(|| panic!("Could not find current page for {}", resp.url()));
+        let last = rels
+            .get("last")
+            .unwrap_or_else(|| panic!("Could not find last page for {}", resp.url()));
+        if cur == last {
+            return None;
+        };
 
-    // Next page
-    Some(nex.raw_uri.clone())
+        // Next page
+        Some(nex.raw_uri.clone())
+    }
+
+    let mut link = Some(options.link.clone());
+    let mut resps = Vec::new();
+
+    while let Some(uri) = link {
+        // GET request
+        let resp = options
+            .client
+            .get(&uri)
+            .bearer_auth(&options.canvas_token)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("Something went wrong when reaching {}, err={e}", uri));
+
+        // Get next page before returning for json
+        link = parse_next_page(&resp);
+        resps.push(resp);
+    }
+
+    resps
 }
 
 #[derive(Parser)]
