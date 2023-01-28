@@ -6,7 +6,7 @@ use chrono::DateTime;
 use clap::Parser;
 use futures::{future::BoxFuture, FutureExt};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use reqwest::header;
+use reqwest::{header, Response};
 use std::{
     path::PathBuf,
     sync::{
@@ -30,39 +30,36 @@ async fn main() -> Result<()> {
 
     let client = reqwest::Client::new();
     let courses_link = format!("{}/api/v1/users/self/favorites/courses", cred.canvas_url);
-
-    // Get courses
-    let courses: Vec<canvas::Course> = client
-        // GET request
-        .get(&courses_link)
-        .bearer_auth(&cred.canvas_token)
-        .send()
-        .await
-        .unwrap_or_else(|e| panic!("Something went wrong when reaching {courses_link}, err={e}"))
-        // Parse json
-        .json::<Vec<serde_json::Value>>()
-        .await?
-        // Filter valid courses
-        .into_iter()
-        .filter_map(|course_json| {
-            course_json.get("enrollments").and_then(|_| {
-                serde_json::from_value(course_json.clone()).unwrap_or_else(|e| {
-                    panic!("Could not parse course with json={course_json}, err={e}")
-                })
-            })
-        })
-        .collect();
-
-    let options = ProcessOptions {
+    let mut options = ProcessOptions {
         canvas_token: cred.canvas_token.clone(),
-        link: String::from(""),
+        link: courses_link,
         parent_folder_path: PathBuf::new(),
         client: client.clone(),
         files_to_download: Arc::new(Mutex::new(Vec::new())),
         download_newer: args.download_newer,
     };
 
+    // Get courses
+    let courses: Vec<canvas::Course> =
+        // Get and parse json
+        futures::future::join_all(get_pages(&options).await.into_iter().map(|resp| async {
+            resp.json::<Vec<serde_json::Value>>()
+                .await
+                .unwrap_or_else(|e| panic!("Failed to parse courses, err={e}"))
+        }))
+        .await
+        .into_iter()
+        // Filter and parse courses
+        .flat_map(|course|
+            course.into_iter().filter_map(|course_json|
+                course_json.get("enrollments").and_then(|_|
+                    serde_json::from_value(course_json.clone()).unwrap_or_else(|e| {
+                        panic!("Could not parse course with json={course_json}, err={e}")
+                    }))))
+        .collect();
+
     println!("Courses found:");
+    options.link.clear();
     for course in courses {
         println!("  * {} - {}", course.course_code, course.name);
 
@@ -297,75 +294,72 @@ fn parse_credentials(args: &CommandLineOptions) -> canvas::Credentials {
 // async recursion needs boxing
 fn process_folders(options: ProcessOptions) -> BoxFuture<'static, ()> {
     async move {
-        let canvas_token = &options.canvas_token;
-        let folders_result = options
-            .client
-            .get(&options.link)
-            .bearer_auth(canvas_token)
-            .send()
-            .await
-            .unwrap_or_else(|e| {
-                panic!(
-                    "Something went wrong when reaching {}, err={e}",
-                    &options.link
-                )
-            })
-            .json::<canvas::FolderResult>()
-            .await;
+        let pages = get_pages(&options).await;
 
-        match folders_result {
-            Ok(canvas::FolderResult::Ok(folders)) => {
-                for folder in folders {
-                    // println!("  * {} - {}", folder.id, folder.name);
-                    let sanitized_folder_name = sanitize_filename::sanitize(folder.name);
-                    // if the folder has no parent, it is the root folder of a course
-                    // so we avoid the extra directory nesting by not appending the root folder name
-                    let folder_path = if folder.parent_folder_id.is_some() {
-                        options
-                            .parent_folder_path
-                            .clone()
-                            .join(sanitized_folder_name)
-                    } else {
-                        options.parent_folder_path.clone()
-                    };
-                    if !folder_path.exists() {
-                        std::fs::create_dir(&folder_path).unwrap_or_else(|e| {
-                            panic!(
-                                "Failed to create directory: {}, err={e}",
-                                folder_path.to_string_lossy()
-                            )
-                        });
+        // For each page
+        for pg in pages {
+            let uri = pg.url().to_string();
+            let folders_result = pg.json::<canvas::FolderResult>().await;
+
+            match folders_result {
+                // Got folders
+                Ok(canvas::FolderResult::Ok(folders)) => {
+                    for folder in folders {
+                        // println!("  * {} - {}", folder.id, folder.name);
+                        let sanitized_folder_name = sanitize_filename::sanitize(folder.name);
+                        // if the folder has no parent, it is the root folder of a course
+                        // so we avoid the extra directory nesting by not appending the root folder name
+                        let folder_path = if folder.parent_folder_id.is_some() {
+                            options
+                                .parent_folder_path
+                                .clone()
+                                .join(sanitized_folder_name)
+                        } else {
+                            options.parent_folder_path.clone()
+                        };
+                        if !folder_path.exists() {
+                            std::fs::create_dir(&folder_path).unwrap_or_else(|e| {
+                                panic!(
+                                    "Failed to create directory: {}, err={e}",
+                                    folder_path.to_string_lossy()
+                                )
+                            });
+                        }
+
+                        let mut new_options = options.clone();
+                        new_options.link = folder.files_url.clone();
+                        new_options.parent_folder_path = folder_path.clone();
+                        process_files(new_options).await;
+
+                        let mut new_options = options.clone();
+                        new_options.link = folder.folders_url.clone();
+                        new_options.parent_folder_path = folder_path.clone();
+                        process_folders(new_options).await;
                     }
-
-                    let mut new_options = options.clone();
-                    new_options.link = folder.files_url.clone();
-                    new_options.parent_folder_path = folder_path.clone();
-                    process_files(new_options).await;
-
-                    let mut new_options = options.clone();
-                    new_options.link = folder.folders_url.clone();
-                    new_options.parent_folder_path = folder_path.clone();
-                    process_folders(new_options).await;
                 }
-            }
-            Ok(canvas::FolderResult::Err { status }) => {
-                let course_has_no_folders = status == "unauthorized";
-                if !course_has_no_folders {
+
+                // Got status code
+                Ok(canvas::FolderResult::Err { status }) => {
+                    let course_has_no_folders = status == "unauthorized";
+                    if !course_has_no_folders {
+                        println!(
+                            "Failed to access folders at link:{}, path:{}, status:{}",
+                            uri,
+                            options.parent_folder_path.to_string_lossy(),
+                            status
+                        );
+                    }
+                }
+
+                // Parse error
+                Err(e) => {
                     println!(
-                        "Failed to access folders at link:{}, path:{}, status:{}",
-                        options.link,
-                        options.parent_folder_path.to_string_lossy(),
-                        status
+                        "Failed to deserialize folders at link:{}, path:{}\n{:?}",
+                        uri,
+                        &options.parent_folder_path.to_string_lossy(),
+                        e
                     );
                 }
-            }
-            Err(e) => {
-                println!(
-                    "Failed to deserialize folders at link:{}, path:{}\n{:?}",
-                    &options.link,
-                    &options.parent_folder_path.to_string_lossy(),
-                    e
-                );
             }
         }
     }
@@ -373,21 +367,48 @@ fn process_folders(options: ProcessOptions) -> BoxFuture<'static, ()> {
 }
 
 async fn process_files(options: ProcessOptions) {
-    let files_result = options
-        .client
-        .get(&options.link)
-        .bearer_auth(&options.canvas_token)
-        .send()
-        .await
-        .unwrap_or_else(|e| {
-            panic!(
-                "Something went wrong when reaching {}, err={e}",
-                &options.link
-            )
-        })
-        .json::<canvas::FileResult>()
-        .await;
+    let pages = get_pages(&options).await;
 
+    // For each page
+    for pg in pages {
+        let uri = pg.url().to_string();
+        let files_result = pg.json::<canvas::FileResult>().await;
+
+        match files_result {
+            // Got files
+            Ok(canvas::FileResult::Ok(files)) => {
+                let mut filtered_files = filter_files(&options, files);
+                let mut lock = options.files_to_download.lock().await;
+                lock.append(&mut filtered_files);
+            }
+
+            // Got status code
+            Ok(canvas::FileResult::Err { status }) => {
+                let course_has_no_files = status == "unauthorized";
+                if !course_has_no_files {
+                    println!(
+                        "Failed to access files at link:{}, path:{}, status:{}",
+                        uri,
+                        options.parent_folder_path.to_string_lossy(),
+                        status
+                    );
+                }
+            }
+
+            // Parse error
+            Err(e) => {
+                println!(
+                    "Failed to deserialize files at link:{}, path:{}\n{:?}",
+                    uri,
+                    &options.parent_folder_path.to_string_lossy(),
+                    e
+                );
+            }
+        };
+    }
+}
+
+fn filter_files(options: &ProcessOptions, files: Vec<canvas::File>) -> Vec<canvas::File> {
     fn updated(filepath: &PathBuf, new_modified: &str) -> bool {
         (|| -> Result<bool> {
             let old_modified = std::fs::metadata(filepath)?.modified()?;
@@ -402,46 +423,67 @@ async fn process_files(options: ProcessOptions) {
         .unwrap_or(false)
     }
 
-    match files_result {
-        Ok(canvas::FileResult::Ok(mut files)) => {
-            for file in &mut files {
-                let sanitized_filename = sanitize_filename::sanitize(&file.display_name);
-                file.filepath = options.parent_folder_path.join(sanitized_filename);
-            }
+    // only download files that do not exist or are updated
+    files
+        .into_iter()
+        .map(|mut f| {
+            let sanitized_filename = sanitize_filename::sanitize(&f.display_name);
+            f.filepath = options.parent_folder_path.join(sanitized_filename);
+            f
+        })
+        .filter(|f| !f.locked_for_user)
+        .filter(|f| {
+            !f.filepath.exists() || (updated(&f.filepath, &f.updated_at)) && options.download_newer
+        })
+        .collect::<Vec<canvas::File>>()
+}
 
-            // only download files that do not exist or are updated
-            let mut filtered_files = files
-                .into_iter()
-                .filter(|f| !f.locked_for_user)
-                .filter(|f| {
-                    !f.filepath.exists()
-                        || (updated(&f.filepath, &f.updated_at)) && options.download_newer
-                })
-                .collect::<Vec<canvas::File>>();
+async fn get_pages(options: &ProcessOptions) -> Vec<Response> {
+    fn parse_next_page(resp: &Response) -> Option<String> {
+        // Parse LINK header
+        let links = resp.headers().get(header::LINK)?.to_str().ok()?; // ok to not have LINK header
+        let rels = parse_link_header::parse_with_rel(links).unwrap_or_else(|e| {
+            panic!(
+                "Error parsing header for next page, uri={}, err={e:?}",
+                resp.url()
+            )
+        });
 
-            let mut lock = options.files_to_download.lock().await;
-            lock.append(&mut filtered_files);
-        }
-        Ok(canvas::FileResult::Err { status }) => {
-            let course_has_no_files = status == "unauthorized";
-            if !course_has_no_files {
-                println!(
-                    "Failed to access files at link:{}, path:{}, status:{}",
-                    options.link,
-                    options.parent_folder_path.to_string_lossy(),
-                    status
-                );
-            }
-        }
-        Err(e) => {
-            println!(
-                "Failed to deserialize files at link:{}, path:{}\n{:?}",
-                &options.link,
-                &options.parent_folder_path.to_string_lossy(),
-                e
-            );
-        }
-    };
+        // Is last page?
+        let nex = rels.get("next")?; // ok to not have "next"
+        let cur = rels
+            .get("current")
+            .unwrap_or_else(|| panic!("Could not find current page for {}", resp.url()));
+        let last = rels
+            .get("last")
+            .unwrap_or_else(|| panic!("Could not find last page for {}", resp.url()));
+        if cur == last {
+            return None;
+        };
+
+        // Next page
+        Some(nex.raw_uri.clone())
+    }
+
+    let mut link = Some(options.link.clone());
+    let mut resps = Vec::new();
+
+    while let Some(uri) = link {
+        // GET request
+        let resp = options
+            .client
+            .get(&uri)
+            .bearer_auth(&options.canvas_token)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("Something went wrong when reaching {}, err={e}", uri));
+
+        // Get next page before returning for json
+        link = parse_next_page(&resp);
+        resps.push(resp);
+    }
+
+    resps
 }
 
 #[derive(Parser)]
