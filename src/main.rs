@@ -295,77 +295,84 @@ fn parse_credentials(args: &CommandLineOptions) -> canvas::Credentials {
 }
 
 // async recursion needs boxing
-fn process_folders(options: ProcessOptions) -> BoxFuture<'static, ()> {
+fn process_folders(mut options: ProcessOptions) -> BoxFuture<'static, ()> {
     async move {
-        let canvas_token = &options.canvas_token;
-        let folders_result = options
-            .client
-            .get(&options.link)
-            .bearer_auth(canvas_token)
-            .send()
-            .await
-            .unwrap_or_else(|e| {
-                panic!(
-                    "Something went wrong when reaching {}, err={e}",
-                    &options.link
-                )
-            })
-            .json::<canvas::FolderResult>()
-            .await;
+        let mut link = Some(std::mem::take(&mut options.link));
 
-        match folders_result {
-            Ok(canvas::FolderResult::Ok(folders)) => {
-                for folder in folders {
-                    // println!("  * {} - {}", folder.id, folder.name);
-                    let sanitized_folder_name = sanitize_filename::sanitize(folder.name);
-                    // if the folder has no parent, it is the root folder of a course
-                    // so we avoid the extra directory nesting by not appending the root folder name
-                    let folder_path = if folder.parent_folder_id.is_some() {
-                        options
-                            .parent_folder_path
-                            .clone()
-                            .join(sanitized_folder_name)
-                    } else {
-                        options.parent_folder_path.clone()
-                    };
-                    if !folder_path.exists() {
-                        std::fs::create_dir(&folder_path).unwrap_or_else(|e| {
-                            panic!(
-                                "Failed to create directory: {}, err={e}",
-                                folder_path.to_string_lossy()
-                            )
-                        });
+        // For each page
+        while let Some(uri) = link {
+            // GET request
+            let resp = options
+                .client
+                .get(&uri)
+                .bearer_auth(&options.canvas_token)
+                .send()
+                .await
+                .unwrap_or_else(|e| panic!("Something went wrong when reaching {}, err={e}", uri));
+
+            // Handle pagination before parsing json
+            link = get_next_page(&resp);
+            let folders_result = resp.json::<canvas::FolderResult>().await;
+
+            match folders_result {
+                // Got folders
+                Ok(canvas::FolderResult::Ok(folders)) => {
+                    for folder in folders {
+                        // println!("  * {} - {}", folder.id, folder.name);
+                        let sanitized_folder_name = sanitize_filename::sanitize(folder.name);
+                        // if the folder has no parent, it is the root folder of a course
+                        // so we avoid the extra directory nesting by not appending the root folder name
+                        let folder_path = if folder.parent_folder_id.is_some() {
+                            options
+                                .parent_folder_path
+                                .clone()
+                                .join(sanitized_folder_name)
+                        } else {
+                            options.parent_folder_path.clone()
+                        };
+                        if !folder_path.exists() {
+                            std::fs::create_dir(&folder_path).unwrap_or_else(|e| {
+                                panic!(
+                                    "Failed to create directory: {}, err={e}",
+                                    folder_path.to_string_lossy()
+                                )
+                            });
+                        }
+
+                        let mut new_options = options.clone();
+                        new_options.link = folder.files_url.clone();
+                        new_options.parent_folder_path = folder_path.clone();
+                        process_files(new_options).await;
+
+                        let mut new_options = options.clone();
+                        new_options.link = folder.folders_url.clone();
+                        new_options.parent_folder_path = folder_path.clone();
+                        process_folders(new_options).await;
                     }
-
-                    let mut new_options = options.clone();
-                    new_options.link = folder.files_url.clone();
-                    new_options.parent_folder_path = folder_path.clone();
-                    process_files(new_options).await;
-
-                    let mut new_options = options.clone();
-                    new_options.link = folder.folders_url.clone();
-                    new_options.parent_folder_path = folder_path.clone();
-                    process_folders(new_options).await;
                 }
-            }
-            Ok(canvas::FolderResult::Err { status }) => {
-                let course_has_no_folders = status == "unauthorized";
-                if !course_has_no_folders {
+
+                // Got status code
+                Ok(canvas::FolderResult::Err { status }) => {
+                    let course_has_no_folders = status == "unauthorized";
+                    if !course_has_no_folders {
+                        println!(
+                            "Failed to access folders at link:{}, path:{}, status:{}",
+                            uri,
+                            options.parent_folder_path.to_string_lossy(),
+                            status
+                        );
+                    }
+                }
+
+                // Parse error
+                Err(e) => {
                     println!(
-                        "Failed to access folders at link:{}, path:{}, status:{}",
-                        options.link,
-                        options.parent_folder_path.to_string_lossy(),
-                        status
+                        "Failed to deserialize folders at link:{}, path:{}\n{:?}",
+                        uri,
+                        &options.parent_folder_path.to_string_lossy(),
+                        e
                     );
                 }
-            }
-            Err(e) => {
-                println!(
-                    "Failed to deserialize folders at link:{}, path:{}\n{:?}",
-                    &options.link,
-                    &options.parent_folder_path.to_string_lossy(),
-                    e
-                );
             }
         }
     }
