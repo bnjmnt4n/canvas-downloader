@@ -6,7 +6,7 @@ use chrono::DateTime;
 use clap::Parser;
 use futures::{future::BoxFuture, FutureExt};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use reqwest::header;
+use reqwest::{header, Response};
 use std::{
     path::PathBuf,
     sync::{
@@ -372,22 +372,59 @@ fn process_folders(options: ProcessOptions) -> BoxFuture<'static, ()> {
     .boxed()
 }
 
-async fn process_files(options: ProcessOptions) {
-    let files_result = options
-        .client
-        .get(&options.link)
-        .bearer_auth(&options.canvas_token)
-        .send()
-        .await
-        .unwrap_or_else(|e| {
-            panic!(
-                "Something went wrong when reaching {}, err={e}",
-                &options.link
-            )
-        })
-        .json::<canvas::FileResult>()
-        .await;
+async fn process_files(mut options: ProcessOptions) {
+    let mut link = Some(std::mem::take(&mut options.link));
 
+    // For each page
+    while let Some(uri) = link {
+        // GET request
+        let resp = options
+            .client
+            .get(&uri)
+            .bearer_auth(&options.canvas_token)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("Something went wrong when reaching {}, err={e}", uri));
+
+        // Handle pagination before parsing json
+        link = get_next_page(&resp);
+        let files_result = resp.json::<canvas::FileResult>().await;
+
+        match files_result {
+            // Got files
+            Ok(canvas::FileResult::Ok(files)) => {
+                let mut filtered_files = filter_files(&options, files);
+                let mut lock = options.files_to_download.lock().await;
+                lock.append(&mut filtered_files);
+            }
+
+            // Got status code
+            Ok(canvas::FileResult::Err { status }) => {
+                let course_has_no_files = status == "unauthorized";
+                if !course_has_no_files {
+                    println!(
+                        "Failed to access files at link:{}, path:{}, status:{}",
+                        uri,
+                        options.parent_folder_path.to_string_lossy(),
+                        status
+                    );
+                }
+            }
+
+            // Parse error
+            Err(e) => {
+                println!(
+                    "Failed to deserialize files at link:{}, path:{}\n{:?}",
+                    uri,
+                    &options.parent_folder_path.to_string_lossy(),
+                    e
+                );
+            }
+        };
+    }
+}
+
+fn filter_files(options: &ProcessOptions, files: Vec<canvas::File>) -> Vec<canvas::File> {
     fn updated(filepath: &PathBuf, new_modified: &str) -> bool {
         (|| -> Result<bool> {
             let old_modified = std::fs::metadata(filepath)?.modified()?;
@@ -402,46 +439,45 @@ async fn process_files(options: ProcessOptions) {
         .unwrap_or(false)
     }
 
-    match files_result {
-        Ok(canvas::FileResult::Ok(mut files)) => {
-            for file in &mut files {
-                let sanitized_filename = sanitize_filename::sanitize(&file.display_name);
-                file.filepath = options.parent_folder_path.join(sanitized_filename);
-            }
+    // only download files that do not exist or are updated
+    files
+        .into_iter()
+        .map(|mut f| {
+            let sanitized_filename = sanitize_filename::sanitize(&f.display_name);
+            f.filepath = options.parent_folder_path.join(sanitized_filename);
+            f
+        })
+        .filter(|f| !f.locked_for_user)
+        .filter(|f| {
+            !f.filepath.exists() || (updated(&f.filepath, &f.updated_at)) && options.download_newer
+        })
+        .collect::<Vec<canvas::File>>()
+}
 
-            // only download files that do not exist or are updated
-            let mut filtered_files = files
-                .into_iter()
-                .filter(|f| !f.locked_for_user)
-                .filter(|f| {
-                    !f.filepath.exists()
-                        || (updated(&f.filepath, &f.updated_at)) && options.download_newer
-                })
-                .collect::<Vec<canvas::File>>();
+fn get_next_page(rsp: &Response) -> Option<String> {
+    // Parse LINK header
+    let links = rsp.headers().get(header::LINK)?.to_str().ok()?; // ok to not have LINK header
+    let rels = parse_link_header::parse_with_rel(links).unwrap_or_else(|e| {
+        panic!(
+            "Error parsing header for next page, uri={}, err={e:?}",
+            rsp.url()
+        )
+    });
 
-            let mut lock = options.files_to_download.lock().await;
-            lock.append(&mut filtered_files);
-        }
-        Ok(canvas::FileResult::Err { status }) => {
-            let course_has_no_files = status == "unauthorized";
-            if !course_has_no_files {
-                println!(
-                    "Failed to access files at link:{}, path:{}, status:{}",
-                    options.link,
-                    options.parent_folder_path.to_string_lossy(),
-                    status
-                );
-            }
-        }
-        Err(e) => {
-            println!(
-                "Failed to deserialize files at link:{}, path:{}\n{:?}",
-                &options.link,
-                &options.parent_folder_path.to_string_lossy(),
-                e
-            );
-        }
+    // Is last page?
+    let nex = rels.get("next")?; // ok to not have "next"
+    let cur = rels
+        .get("current")
+        .unwrap_or_else(|| panic!("Could not find current page for {}", rsp.url()));
+    let last = rels
+        .get("last")
+        .unwrap_or_else(|| panic!("Could not find last page for {}", rsp.url()));
+    if cur == last {
+        return None;
     };
+
+    // Next page
+    Some(nex.raw_uri.clone())
 }
 
 #[derive(Parser)]
