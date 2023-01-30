@@ -56,16 +56,32 @@ async fn main() -> Result<()> {
                     serde_json::from_value(course_json.clone()).unwrap_or_else(|e| {
                         panic!("Could not parse course with json={course_json}, err={e}")
                     }))))
-        .filter(|course_json: &canvas::Course| {
-            !args.enrollment_term_id.is_some() || (args.enrollment_term_id.unwrap_or_else(|| {
-                panic!("Invalid enrollment term id provided")
-            }) == (*course_json).enrollment_term_id)
-        })
         .collect();
+
+    if args.enrollment_term_ids.is_none() {
+        print_all_courses_by_term(&courses);
+        return Ok(());
+    }
+
+    let courses_matching_term_ids: Vec<&canvas::Course> = courses
+        .iter()
+        .filter(|course_json: &&canvas::Course| {
+            args.enrollment_term_ids
+                .as_ref()
+                .unwrap_or_else(|| panic!("Invalid enrollment term id provided"))
+                .iter()
+                .any(|id| id == &course_json.enrollment_term_id)
+        })
+        .collect::<Vec<&canvas::Course>>();
+
+    if courses_matching_term_ids.is_empty() {
+        print_all_courses_by_term(&courses);
+        return Ok(());
+    }
 
     println!("Courses found:");
     options.link.clear();
-    for course in courses {
+    for course in courses_matching_term_ids {
         println!("  * {} - {}", course.course_code, course.name);
 
         let course_folder_path = args
@@ -257,6 +273,40 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn print_all_courses_by_term(courses: &[canvas::Course]) {
+    let mut grouped_courses: Vec<canvas::CoursesWithId> = Vec::new();
+
+    'outer: for course in courses.iter() {
+        let course_id = course.enrollment_term_id;
+        for courses_with_id in grouped_courses.iter_mut() {
+            if courses_with_id.id == course_id {
+                courses_with_id.courses.push(&course.course_code);
+                continue 'outer;
+            }
+        }
+        grouped_courses.push(canvas::CoursesWithId {
+            id: course.enrollment_term_id,
+            courses: vec![&course.course_code],
+        })
+    }
+    println!(
+        "Please specify the correct term ids as per the list below\nTerm IDs  | \
+        Courses"
+    );
+    for courses_with_id in grouped_courses.iter_mut() {
+        print!("{: <10}|", courses_with_id.id);
+        let mut temp = courses_with_id.courses.iter();
+        if let Some(arg) = temp.next() {
+            print!("{}", &arg);
+
+            for &arg in temp {
+                print!(", {}", &arg)
+            }
+        }
+        println!()
+    }
 }
 
 fn parse_credentials(args: &CommandLineOptions) -> canvas::Credentials {
@@ -505,8 +555,8 @@ struct CommandLineOptions {
     save_credentials: bool,
     #[clap(short = 'n', long, takes_value = false)]
     download_newer: bool,
-    #[clap(short = 'i', long)]
-    enrollment_term_id: Option<u32>,
+    #[clap(short = 'i', long, multiple_values = true)]
+    enrollment_term_ids: Option<Vec<u32>>,
 }
 
 mod canvas {
@@ -527,6 +577,11 @@ mod canvas {
         pub name: String,
         pub course_code: String,
         pub enrollment_term_id: u32,
+    }
+
+    pub struct CoursesWithId<'a> {
+        pub id: u32,
+        pub courses: Vec<&'a String>,
     }
 
     #[derive(Deserialize)]
