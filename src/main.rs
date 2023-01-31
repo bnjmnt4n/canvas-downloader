@@ -7,6 +7,7 @@ use clap::Parser;
 use futures::{future::BoxFuture, FutureExt};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::{header, Response};
+use std::collections::HashMap;
 use std::{
     path::PathBuf,
     sync::{
@@ -276,36 +277,21 @@ async fn main() -> Result<()> {
 }
 
 fn print_all_courses_by_term(courses: &[canvas::Course]) {
-    let mut grouped_courses: Vec<canvas::CoursesWithId> = Vec::new();
+    let mut grouped_courses: HashMap<u32, Vec<&String>> = HashMap::new();
 
-    'outer: for course in courses.iter() {
-        let course_id = course.enrollment_term_id;
-        for courses_with_id in grouped_courses.iter_mut() {
-            if courses_with_id.id == course_id {
-                courses_with_id.courses.push(&course.course_code);
-                continue 'outer;
-            }
-        }
-        grouped_courses.push(canvas::CoursesWithId {
-            id: course.enrollment_term_id,
-            courses: vec![&course.course_code],
-        })
+    for course in courses.iter() {
+        let course_id: u32 = course.enrollment_term_id;
+        grouped_courses
+            .entry(course_id)
+            .or_insert_with(Vec::new)
+            .push(&course.course_code);
     }
     println!(
         "Please specify the correct term ids as per the list below\nTerm IDs  | \
         Courses"
     );
-    for courses_with_id in grouped_courses.iter_mut() {
-        print!("{: <10}|", courses_with_id.id);
-        let mut temp = courses_with_id.courses.iter();
-        if let Some(arg) = temp.next() {
-            print!("{}", &arg);
-
-            for &arg in temp {
-                print!(", {}", &arg)
-            }
-        }
-        println!()
+    for (key, value) in &grouped_courses {
+        println!("{: <10}| {:?}", key, value);
     }
 }
 
@@ -577,11 +563,6 @@ mod canvas {
         pub name: String,
         pub course_code: String,
         pub enrollment_term_id: u32,
-    }
-
-    pub struct CoursesWithId<'a> {
-        pub id: u32,
-        pub courses: Vec<&'a String>,
     }
 
     #[derive(Deserialize)]
