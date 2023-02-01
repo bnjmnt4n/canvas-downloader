@@ -277,7 +277,7 @@ async fn main() -> Result<()> {
 }
 
 fn print_all_courses_by_term(courses: &[canvas::Course]) {
-    let mut grouped_courses: HashMap<u32, Vec<&String>> = HashMap::new();
+    let mut grouped_courses: HashMap<u32, Vec<&str>> = HashMap::new();
 
     for course in courses.iter() {
         let course_id: u32 = course.enrollment_term_id;
@@ -287,7 +287,7 @@ fn print_all_courses_by_term(courses: &[canvas::Course]) {
             .push(&course.course_code);
     }
     println!(
-        "Please specify the correct term ids as per the list below\nTerm IDs  | \
+        "Please provide the Term ID(s) to download via -i\nTerm IDs  | \
         Courses"
     );
     for (key, value) in &grouped_courses {
@@ -476,7 +476,7 @@ fn filter_files(options: &ProcessOptions, files: Vec<canvas::File>) -> Vec<canva
         .filter(|f| {
             !f.filepath.exists() || (updated(&f.filepath, &f.updated_at)) && options.download_newer
         })
-        .collect::<Vec<canvas::File>>()
+        .collect()
 }
 
 async fn get_pages(options: &ProcessOptions) -> Vec<Response> {
