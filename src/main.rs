@@ -7,6 +7,7 @@ use clap::Parser;
 use futures::{future::BoxFuture, FutureExt};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::{header, Response};
+use std::collections::HashMap;
 use std::{
     path::PathBuf,
     sync::{
@@ -58,9 +59,30 @@ async fn main() -> Result<()> {
                     }))))
         .collect();
 
+    if args.enrollment_term_ids.is_none() {
+        print_all_courses_by_term(&courses);
+        return Ok(());
+    }
+
+    let courses_matching_term_ids: Vec<&canvas::Course> = courses
+        .iter()
+        .filter(|course_json: &&canvas::Course| {
+            args.enrollment_term_ids
+                .as_ref()
+                .unwrap_or_else(|| panic!("Invalid enrollment term id provided"))
+                .iter()
+                .any(|id| id == &course_json.enrollment_term_id)
+        })
+        .collect::<Vec<&canvas::Course>>();
+
+    if courses_matching_term_ids.is_empty() {
+        print_all_courses_by_term(&courses);
+        return Ok(());
+    }
+
     println!("Courses found:");
     options.link.clear();
-    for course in courses {
+    for course in courses_matching_term_ids {
         println!("  * {} - {}", course.course_code, course.name);
 
         let course_folder_path = args
@@ -254,6 +276,25 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn print_all_courses_by_term(courses: &[canvas::Course]) {
+    let mut grouped_courses: HashMap<u32, Vec<&str>> = HashMap::new();
+
+    for course in courses.iter() {
+        let course_id: u32 = course.enrollment_term_id;
+        grouped_courses
+            .entry(course_id)
+            .or_insert_with(Vec::new)
+            .push(&course.course_code);
+    }
+    println!(
+        "Please provide the Term ID(s) to download via -i\nTerm IDs  | \
+        Courses"
+    );
+    for (key, value) in &grouped_courses {
+        println!("{: <10}| {:?}", key, value);
+    }
+}
+
 fn parse_credentials(args: &CommandLineOptions) -> canvas::Credentials {
     // Parse...
     let cred = if let (Some(url), Some(token)) = (&args.canvas_url, &args.canvas_token) {
@@ -435,7 +476,7 @@ fn filter_files(options: &ProcessOptions, files: Vec<canvas::File>) -> Vec<canva
         .filter(|f| {
             !f.filepath.exists() || (updated(&f.filepath, &f.updated_at)) && options.download_newer
         })
-        .collect::<Vec<canvas::File>>()
+        .collect()
 }
 
 async fn get_pages(options: &ProcessOptions) -> Vec<Response> {
@@ -500,6 +541,8 @@ struct CommandLineOptions {
     save_credentials: bool,
     #[clap(short = 'n', long, takes_value = false)]
     download_newer: bool,
+    #[clap(short = 'i', long, multiple_values = true)]
+    enrollment_term_ids: Option<Vec<u32>>,
 }
 
 mod canvas {
@@ -519,6 +562,7 @@ mod canvas {
         pub id: u32,
         pub name: String,
         pub course_code: String,
+        pub enrollment_term_id: u32,
     }
 
     #[derive(Deserialize)]
