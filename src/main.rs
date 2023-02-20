@@ -25,7 +25,7 @@ struct CommandLineOptions {
     credential_file: PathBuf,
     #[arg(short = 'd', long, value_name = "FOLDER", default_value = ".")]
     destination_folder: PathBuf,
-    #[arg(short = 'n', long, default_missing_value = "false")]
+    #[arg(short = 'n', long)]
     download_newer: bool,
     #[arg(short = 't', long, value_name = "ID", num_args(1..))]
     term_ids: Option<Vec<u32>>,
@@ -449,7 +449,7 @@ fn filter_files(options: &ProcessOptions, files: Vec<canvas::File>) -> Vec<canva
         })
         .filter(|f| !f.locked_for_user)
         .filter(|f| {
-            !f.filepath.exists() || (updated(&f.filepath, &f.updated_at)) && options.download_newer
+            !f.filepath.exists() || (updated(&f.filepath, &f.updated_at) && options.download_newer)
         })
         .collect()
 }
