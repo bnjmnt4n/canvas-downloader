@@ -3,33 +3,56 @@
 ## Description
 Downloads files from all courses in canvas.
 
-## Note for macOS
+## Usage
+1. Create a credential json file, eg `cred.json`
+```json
+{
+  "canvasUrl": "https://canvas.nus.edu.sg",
+  "canvasToken": "12345~jfkdlejoiferjiofu"
+}
+```
+  - `canvasUrl` should include "https://"
+  - `canvasToken` can be created from Account > Settings > New Access Token
+2. Get Term IDs by running `canvas-downloader` with the credential file, eg
+```shell
+$ canvas-downloader --credential-file cred.json
+Please provide the Term ID(s) to download via -t
+Term IDs  | Courses
+115       | ["CS1101S", "CS1231S"]
+120       | ["CS2040S", "CS2030"]
+125       | ["CS3230"]
+```
+3. Rerun `canvas-downloader` with the terms you are interested in downloading, eg
+```shell
+$ canvas-downloader --credential-file cred.json -t 115 120
+Courses found:
+  * CS1101S
+  * CS1231S
+  ...
+```
+
+### Additional Options
+- To explore more options, use `--help` or `-h`
+```shell
+$ canvas-downloader --help
+Usage: canvas-downloader [OPTIONS] --credential-file <FILE>
+
+Options:
+  -c, --credential-file <FILE>       
+  -d, --destination-folder <FOLDER>  [default: .]
+  -n, --download-newer               
+  -t, --term-ids <ID>...             
+  -h, --help                         Print help
+  -V, --version                      Print version
+```
+- If you want to download files updated on canvas, use `--download-newer` or `-n`. By default, files updated on canvas will not overwrite already downloaded files. 
+- If you want to specify where to download files into, use `--destination-folder` or `-d`. By default, files will be downloaded to the folder in which the program is called.
+
+### Note for macOS
 - To use the executable downloaded from **Releases**, use `xattr` to remove the quarantine
-    - e.g. `xattr -d com.apple.quarantine canvas-downloader`
+  - e.g. `xattr -d com.apple.quarantine canvas-downloader`
 - This occurs because the executable has not been signed with an apple developer account
 - If it is not showing up as an executable
-    - `chmod +x canvas-downloader`
-    - This should make it executable
+  - `chmod +x canvas-downloader`
+  - This should make it executable
 
-## Usage
-- Get your canvas url (i.e. `https://canvas.example.com`)
-    - Ensure the url has 'https://'
-    - This url is the one that you would use to access the canvas website for your institution
-- Get your api token
-    - You can create one under Account > Settings > New Access Token
-- `./canvas-downloader -i <TERM ID> -u <CANVAS URL> -t <CANVAS API TOKEN> -d <DESTINATION FOLDER>`
-    - Manually pass in the term id, url and token to canvas and save the files to the destination folder
-    - e.g. command: `./canvas-downloader -i 120 -u https://canvas.example.com -t 12345~jfkdlejoiferjiofudjsifokjewqifropjdislfjeiwljfpejiopfejsdaojfodd -d ~/courses`
-- `./canvas-downloader -i <TERM ID> -u <CANVAS URL> -t <CANVAS API TOKEN> -d <DESTINATION FOLDER> -s -c <CREDENTIAL PATH>`
-    - Same as the first command but this saves the url and token as a json file to `<CREDENTIAL PATH>`
-    - `-s` tells it to save the credentials to `<CREDENTIAL PATH>`
-    - The file will be created if it does not exists
-    - e.g. command: `./canvas-downloader -i 120 -u https://canvas.example.com -t 12345~jfkdlejoiferjiofudjsifokjewqifropjdislfjeiwljfpejiopfejsdaojfodd -d ~/courses -s -c ~/credentials.json`
-- `./canvas-downloader -i <TERM ID> -d <DESTINATION FOLDER> -c <CREDENTIAL PATH>`
-    - Same as the first command but reads the credentials from `<CREDENTIAL PATH>`
-    - e.g. command: `./canvas-downloader -i 120 -d ~/courses -c ~/credentials.json`
-- Recommended to alias the command to use `-u` and `-t`, or `-c` to avoid typing so much
-- The downloader will not download the file if there is already a file at where it should be saved to
-    - If you want the new version, you need to use the `-n` flag
-- If you are unsure as to the correct term ids for the courses you wish to download, run `canvas-downloader` without the `-i` flag. This will output a list of courses associated with the term ids.
-- You can specify multiple term ids seperated by commas. 
