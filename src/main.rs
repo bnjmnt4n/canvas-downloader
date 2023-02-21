@@ -17,11 +17,29 @@ use std::{
 };
 use tokio::sync::Mutex;
 
+#[derive(Parser)]
+#[command(name = "Canvas Downloader")]
+#[command(version)]
+struct CommandLineOptions {
+    #[arg(short = 'c', long, value_name = "FILE")]
+    credential_file: PathBuf,
+    #[arg(short = 'd', long, value_name = "FOLDER", default_value = ".")]
+    destination_folder: PathBuf,
+    #[arg(short = 'n', long)]
+    download_newer: bool,
+    #[arg(short = 't', long, value_name = "ID", num_args(1..))]
+    term_ids: Option<Vec<u32>>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = CommandLineOptions::parse();
 
-    let cred = parse_credentials(&args);
+    // Load credentials
+    let file = std::fs::File::open(&args.credential_file)
+        .with_context(|| "Could not open credential file")?;
+    let cred: canvas::Credentials =
+        serde_json::from_reader(file).with_context(|| "Credential file is not valid json")?;
 
     // Create sub-folder if not exists
     if !args.destination_folder.exists() {
@@ -29,6 +47,7 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|e| panic!("Failed to create destination directory, err={e}"));
     }
 
+    // Prepare GET request options
     let client = reqwest::Client::new();
     let courses_link = format!("{}/api/v1/users/self/favorites/courses", cred.canvas_url);
     let mut options = ProcessOptions {
@@ -59,23 +78,19 @@ async fn main() -> Result<()> {
                     }))))
         .collect();
 
-    if args.enrollment_term_ids.is_none() {
+    // Filter courses by term IDs
+    let Some(term_ids) = args.term_ids else {
+        println!("Please provide the Term ID(s) to download via -t");
         print_all_courses_by_term(&courses);
         return Ok(());
-    }
-
+    };
     let courses_matching_term_ids: Vec<&canvas::Course> = courses
         .iter()
-        .filter(|course_json: &&canvas::Course| {
-            args.enrollment_term_ids
-                .as_ref()
-                .unwrap_or_else(|| panic!("Invalid enrollment term id provided"))
-                .iter()
-                .any(|id| id == &course_json.enrollment_term_id)
-        })
+        .filter(|course_json: &&canvas::Course| term_ids.contains(&course_json.enrollment_term_id))
         .collect::<Vec<&canvas::Course>>();
-
     if courses_matching_term_ids.is_empty() {
+        println!("Could not find any course matching Term ID(s) {term_ids:?}");
+        println!("Please try the following ID(s) instead");
         print_all_courses_by_term(&courses);
         return Ok(());
     }
@@ -286,50 +301,10 @@ fn print_all_courses_by_term(courses: &[canvas::Course]) {
             .or_insert_with(Vec::new)
             .push(&course.course_code);
     }
-    println!(
-        "Please provide the Term ID(s) to download via -i\nTerm IDs  | \
-        Courses"
-    );
+    println!("{: <10}| {:?}", "Term IDs", "Courses");
     for (key, value) in &grouped_courses {
         println!("{: <10}| {:?}", key, value);
     }
-}
-
-fn parse_credentials(args: &CommandLineOptions) -> canvas::Credentials {
-    // Parse...
-    let cred = if let (Some(url), Some(token)) = (&args.canvas_url, &args.canvas_token) {
-        // ...from CLI
-        canvas::Credentials {
-            canvas_url: url.clone(),
-            canvas_token: token.clone(),
-        }
-    } else if let Some(path) = &args.canvas_credential_path {
-        // ...from file
-        assert!(
-            !args.save_credentials,
-            "To save credentials, please provide url and token via -u and -t respectively"
-        );
-        let file = std::fs::File::open(path)
-            .unwrap_or_else(|e| panic!("Could not open credential file, err={e}"));
-        serde_json::from_reader(file).expect("Credential file is not valid json")
-    } else {
-        panic!(
-            "Provide canvas url and token via -u and -t respectively or via a credential file -c"
-        );
-    };
-
-    // Save credentials
-    if args.save_credentials {
-        let Some(path) = &args.canvas_credential_path else {
-            panic!("To save credentials, please provide credential file via -c");
-        };
-        let file = std::fs::File::create(path)
-            .unwrap_or_else(|e| panic!("Could not open credential file, err={e}"));
-        serde_json::to_writer_pretty(file, &cred)
-            .unwrap_or_else(|e| panic!("Could not write credential file, err={e}"));
-    }
-
-    cred
 }
 
 // async recursion needs boxing
@@ -474,7 +449,7 @@ fn filter_files(options: &ProcessOptions, files: Vec<canvas::File>) -> Vec<canva
         })
         .filter(|f| !f.locked_for_user)
         .filter(|f| {
-            !f.filepath.exists() || (updated(&f.filepath, &f.updated_at)) && options.download_newer
+            !f.filepath.exists() || (updated(&f.filepath, &f.updated_at) && options.download_newer)
         })
         .collect()
 }
@@ -525,24 +500,6 @@ async fn get_pages(options: &ProcessOptions) -> Vec<Response> {
     }
 
     resps
-}
-
-#[derive(Parser)]
-struct CommandLineOptions {
-    #[clap(short = 'u', long, forbid_empty_values = true)]
-    canvas_url: Option<String>,
-    #[clap(short = 't', long, forbid_empty_values = true)]
-    canvas_token: Option<String>,
-    #[clap(short = 'c', long, parse(from_os_str), forbid_empty_values = true)]
-    canvas_credential_path: Option<PathBuf>,
-    #[clap(short = 'd', long, parse(from_os_str), default_value = ".")]
-    destination_folder: PathBuf,
-    #[clap(short = 's', long, takes_value = false)]
-    save_credentials: bool,
-    #[clap(short = 'n', long, takes_value = false)]
-    download_newer: bool,
-    #[clap(short = 'i', long, multiple_values = true)]
-    enrollment_term_ids: Option<Vec<u32>>,
 }
 
 mod canvas {
