@@ -1,7 +1,7 @@
 #![deny(clippy::unwrap_used)]
 
 use anyhow::{Context, Result};
-use canvas::ProcessOptions;
+use canvas::{File, ProcessOptions};
 use chrono::DateTime;
 use clap::Parser;
 use futures::{future::BoxFuture, FutureExt};
@@ -9,7 +9,7 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use reqwest::{header, Response};
 use std::collections::HashMap;
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -50,19 +50,20 @@ async fn main() -> Result<()> {
     // Prepare GET request options
     let client = reqwest::Client::new();
     let courses_link = format!("{}/api/v1/users/self/favorites/courses", cred.canvas_url);
-    let mut options = ProcessOptions {
+    let options = Arc::new(ProcessOptions {
         canvas_token: cred.canvas_token.clone(),
-        link: courses_link,
-        parent_folder_path: PathBuf::new(),
         client: client.clone(),
-        files_to_download: Arc::new(Mutex::new(Vec::new())),
+        files_to_download: Mutex::new(Vec::new()),
         download_newer: args.download_newer,
-    };
+        n_active_requests: AtomicUsize::new(0),
+        sem_requests: tokio::sync::Semaphore::new(8), // WARN magic constant.
+                                                      // TODO handle canvas rate limiting errors, maybe scale up if possible
+    });
 
     // Get courses
     let courses: Vec<canvas::Course> =
         // Get and parse json
-        futures::future::join_all(get_pages(&options).await.into_iter().map(|resp| async {
+        futures::future::join_all(get_pages(courses_link, &options).await.into_iter().map(|resp| async {
             resp.json::<Vec<serde_json::Value>>()
                 .await
                 .unwrap_or_else(|e| panic!("Failed to parse courses, err={e}"))
@@ -96,10 +97,10 @@ async fn main() -> Result<()> {
     }
 
     println!("Courses found:");
-    options.link.clear();
     for course in courses_matching_term_ids {
         println!("  * {} - {}", course.course_code, course.name);
 
+        // Prep path and mkdir -p
         let course_folder_path = args
             .destination_folder
             .join(course.course_code.replace('/', "_"));
@@ -112,17 +113,13 @@ async fn main() -> Result<()> {
             })?;
         }
 
-        // this api gives us the root folder
+        // Prep URL for course's root folder
         let course_folders_link = format!(
             "{}/api/v1/courses/{}/folders/by_path/",
             cred.canvas_url, course.id
         );
 
-        let mut new_options = options.clone();
-        new_options.link = course_folders_link;
-        new_options.parent_folder_path = course_folder_path;
-
-        process_folders(new_options).await;
+        process_folders(course_folders_link, course_folder_path, options.clone()).await;
     }
 
     println!();
@@ -308,9 +305,13 @@ fn print_all_courses_by_term(courses: &[canvas::Course]) {
 }
 
 // async recursion needs boxing
-fn process_folders(options: ProcessOptions) -> BoxFuture<'static, ()> {
+fn process_folders(
+    url: String,
+    path: PathBuf,
+    options: Arc<ProcessOptions>,
+) -> BoxFuture<'static, ()> {
     async move {
-        let pages = get_pages(&options).await;
+        let pages = get_pages(url, &options).await;
 
         // For each page
         for pg in pages {
@@ -326,12 +327,9 @@ fn process_folders(options: ProcessOptions) -> BoxFuture<'static, ()> {
                         // if the folder has no parent, it is the root folder of a course
                         // so we avoid the extra directory nesting by not appending the root folder name
                         let folder_path = if folder.parent_folder_id.is_some() {
-                            options
-                                .parent_folder_path
-                                .clone()
-                                .join(sanitized_folder_name)
+                            path.join(sanitized_folder_name)
                         } else {
-                            options.parent_folder_path.clone()
+                            path.clone()
                         };
                         if !folder_path.exists() {
                             std::fs::create_dir(&folder_path).unwrap_or_else(|e| {
@@ -342,15 +340,8 @@ fn process_folders(options: ProcessOptions) -> BoxFuture<'static, ()> {
                             });
                         }
 
-                        let mut new_options = options.clone();
-                        new_options.link = folder.files_url.clone();
-                        new_options.parent_folder_path = folder_path.clone();
-                        process_files(new_options).await;
-
-                        let mut new_options = options.clone();
-                        new_options.link = folder.folders_url.clone();
-                        new_options.parent_folder_path = folder_path.clone();
-                        process_folders(new_options).await;
+                        process_files(folder.files_url, folder_path.clone(), options.clone()).await;
+                        process_folders(folder.folders_url, folder_path, options.clone()).await;
                     }
                 }
 
@@ -359,10 +350,7 @@ fn process_folders(options: ProcessOptions) -> BoxFuture<'static, ()> {
                     let course_has_no_folders = status == "unauthorized";
                     if !course_has_no_folders {
                         println!(
-                            "Failed to access folders at link:{}, path:{}, status:{}",
-                            uri,
-                            options.parent_folder_path.to_string_lossy(),
-                            status
+                            "Failed to access folders at link:{uri}, path:{path:?}, status:{status}",
                         );
                     }
                 }
@@ -370,10 +358,7 @@ fn process_folders(options: ProcessOptions) -> BoxFuture<'static, ()> {
                 // Parse error
                 Err(e) => {
                     println!(
-                        "Failed to deserialize folders at link:{}, path:{}\n{:?}",
-                        uri,
-                        &options.parent_folder_path.to_string_lossy(),
-                        e
+                        "Failed to deserialize folders at link:{uri}, path:{path:?}\n{e:?}",
                     );
                 }
             }
@@ -382,8 +367,8 @@ fn process_folders(options: ProcessOptions) -> BoxFuture<'static, ()> {
     .boxed()
 }
 
-async fn process_files(options: ProcessOptions) {
-    let pages = get_pages(&options).await;
+async fn process_files(url: String, path: PathBuf, options: Arc<ProcessOptions>) {
+    let pages = get_pages(url, &options).await;
 
     // For each page
     for pg in pages {
@@ -393,7 +378,7 @@ async fn process_files(options: ProcessOptions) {
         match files_result {
             // Got files
             Ok(canvas::FileResult::Ok(files)) => {
-                let mut filtered_files = filter_files(&options, files);
+                let mut filtered_files = filter_files(&options, &path, files);
                 let mut lock = options.files_to_download.lock().await;
                 lock.append(&mut filtered_files);
             }
@@ -403,28 +388,20 @@ async fn process_files(options: ProcessOptions) {
                 let course_has_no_files = status == "unauthorized";
                 if !course_has_no_files {
                     println!(
-                        "Failed to access files at link:{}, path:{}, status:{}",
-                        uri,
-                        options.parent_folder_path.to_string_lossy(),
-                        status
+                        "Failed to access files at link:{uri}, path:{path:?}, status:{status}",
                     );
                 }
             }
 
             // Parse error
             Err(e) => {
-                println!(
-                    "Failed to deserialize files at link:{}, path:{}\n{:?}",
-                    uri,
-                    &options.parent_folder_path.to_string_lossy(),
-                    e
-                );
+                println!("Failed to deserialize files at link:{uri}, path:{path:?}\n{e:?}",);
             }
         };
     }
 }
 
-fn filter_files(options: &ProcessOptions, files: Vec<canvas::File>) -> Vec<canvas::File> {
+fn filter_files(options: &ProcessOptions, path: &Path, files: Vec<File>) -> Vec<File> {
     fn updated(filepath: &PathBuf, new_modified: &str) -> bool {
         (|| -> Result<bool> {
             let old_modified = std::fs::metadata(filepath)?.modified()?;
@@ -444,7 +421,7 @@ fn filter_files(options: &ProcessOptions, files: Vec<canvas::File>) -> Vec<canva
         .into_iter()
         .map(|mut f| {
             let sanitized_filename = sanitize_filename::sanitize(&f.display_name);
-            f.filepath = options.parent_folder_path.join(sanitized_filename);
+            f.filepath = path.join(sanitized_filename);
             f
         })
         .filter(|f| !f.locked_for_user)
@@ -454,7 +431,7 @@ fn filter_files(options: &ProcessOptions, files: Vec<canvas::File>) -> Vec<canva
         .collect()
 }
 
-async fn get_pages(options: &ProcessOptions) -> Vec<Response> {
+async fn get_pages(link: String, options: &ProcessOptions) -> Vec<Response> {
     fn parse_next_page(resp: &Response) -> Option<String> {
         // Parse LINK header
         let links = resp.headers().get(header::LINK)?.to_str().ok()?; // ok to not have LINK header
@@ -481,7 +458,7 @@ async fn get_pages(options: &ProcessOptions) -> Vec<Response> {
         Some(nex.raw_uri.clone())
     }
 
-    let mut link = Some(options.link.clone());
+    let mut link = Some(link);
     let mut resps = Vec::new();
 
     while let Some(uri) = link {
@@ -504,7 +481,7 @@ async fn get_pages(options: &ProcessOptions) -> Vec<Response> {
 
 mod canvas {
     use serde::{Deserialize, Serialize};
-    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
     use tokio::sync::Mutex;
 
     #[derive(Clone, Deserialize, Serialize)]
@@ -560,13 +537,16 @@ mod canvas {
         pub filepath: std::path::PathBuf,
     }
 
-    #[derive(Clone)]
+    #[derive(Debug)]
     pub struct ProcessOptions {
+        // Input parameters
         pub canvas_token: String,
         pub client: reqwest::Client,
-        pub link: String,
-        pub parent_folder_path: std::path::PathBuf,
-        pub files_to_download: Arc<Mutex<Vec<File>>>,
         pub download_newer: bool,
+        // Output
+        pub files_to_download: Mutex<Vec<File>>,
+        // Synchronization
+        pub n_active_requests: AtomicUsize, // main() waits for this to be 0
+        pub sem_requests: tokio::sync::Semaphore, // Limit #active requests
     }
 }
