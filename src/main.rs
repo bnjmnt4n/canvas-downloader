@@ -42,7 +42,10 @@ macro_rules! fork {
                     panic!("Please report on GitHub. Unexpected closed sem, err={e}")
                 });
                 $f(url, path, options.clone()).await;
-                options.n_active_requests.fetch_sub(1, Ordering::AcqRel);
+                let new_val = options.n_active_requests.fetch_sub(1, Ordering::AcqRel) - 1;
+                if new_val == 0 {
+                    options.notify_main.notify_one();
+                }
             });
         }
         f($url, $path, $options);
@@ -75,7 +78,8 @@ async fn main() -> Result<()> {
         download_newer: args.download_newer,
         n_active_requests: AtomicUsize::new(0),
         sem_requests: tokio::sync::Semaphore::new(8), // WARN magic constant.
-                                                      // TODO handle canvas rate limiting errors, maybe scale up if possible
+        // TODO handle canvas rate limiting errors, maybe scale up if possible
+        notify_main: tokio::sync::Notify::new(),
     });
 
     // Get courses
@@ -153,13 +157,11 @@ async fn main() -> Result<()> {
     //    4. --> main() progresses only after all files have been queried
     // 2. No starvation: forks are done acyclically, all tasks +1 and -1 exactly once
     // 3. Bounded concurrency: acquire or block on semaphore before request
-    // Re busy wait: a better (but longer) solution is for the last process_file/folder to notify a
-    //    condition var
-    while options.n_active_requests.load(Ordering::Acquire) > 0 {
-        tokio::task::yield_now().await;
-    }
+    // 4. No busy wait: Last task will see that there are 0 active requests and notify main
+    options.notify_main.notified().await;
     // Sanity check: running tasks trying to acquire sem will panic
     options.sem_requests.close();
+    assert_eq!(options.n_active_requests.load(Ordering::Acquire), 0);
     println!();
 
     // Tokio uses the number of cpus as num of work threads in the default runtime
@@ -587,5 +589,6 @@ mod canvas {
         // Synchronization
         pub n_active_requests: AtomicUsize, // main() waits for this to be 0
         pub sem_requests: tokio::sync::Semaphore, // Limit #active requests
+        pub notify_main: tokio::sync::Notify,
     }
 }
