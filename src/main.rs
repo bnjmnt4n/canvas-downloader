@@ -1,5 +1,13 @@
 #![deny(clippy::unwrap_used)]
 
+use anyhow::{Context, Result};
+use canvas::{File, ProcessOptions};
+use chrono::DateTime;
+use clap::Parser;
+use futures::future::ready;
+use futures::{stream, StreamExt, TryStreamExt};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use reqwest::{header, Response};
 use std::collections::HashMap;
 use std::{
     path::{Path, PathBuf},
@@ -8,14 +16,6 @@ use std::{
         Arc,
     },
 };
-
-use anyhow::{Context, Result};
-use chrono::DateTime;
-use clap::Parser;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use reqwest::{header, Response};
-
-use canvas::{File, ProcessOptions};
 
 #[derive(Parser)]
 #[command(name = "Canvas Downloader")]
@@ -83,23 +83,20 @@ async fn main() -> Result<()> {
     });
 
     // Get courses
-    let courses: Vec<canvas::Course> =
-        // Get and parse json
-        futures::future::join_all(get_pages(courses_link, &options).await.into_iter().map(|resp| async {
-            resp.json::<Vec<serde_json::Value>>()
-                .await
-                .unwrap_or_else(|e| panic!("Failed to parse courses, err={e}"))
-        }))
-            .await
-            .into_iter()
-            // Filter and parse courses
-            .flat_map(|course|
-                course.into_iter().filter_map(|course_json|
-                    course_json.get("enrollments").and_then(|_|
-                        serde_json::from_value(course_json.clone()).unwrap_or_else(|e| {
-                            panic!("Could not parse course with json={course_json}, err={e}")
-                        }))))
-            .collect();
+    let courses: Vec<canvas::Course> = get_pages(courses_link.clone(), &options)
+        .await
+        .into_iter()
+        .map(|resp| resp.json::<Vec<serde_json::Value>>()) // resp --> Result<Vec<json>>
+        .collect::<stream::FuturesUnordered<_>>() // (in any order)
+        .flat_map_unordered(None, |json_res| {
+            let jsons = json_res.unwrap_or_else(|e| panic!("Failed to parse courses, err={e}")); // Result<Vec<json>> --> Vec<json>
+            stream::iter(jsons.into_iter()) // Vec<json> --> json
+        })
+        .filter(|json| ready(json.get("enrollments").is_some())) // (enrolled?)
+        .map(serde_json::from_value) // json --> Result<course>
+        .try_collect()
+        .await
+        .with_context(|| "Failed to deserialize course json")?; // Result<course> --> course
 
     // Filter courses by term IDs
     let Some(term_ids) = args.term_ids else {
@@ -109,8 +106,8 @@ async fn main() -> Result<()> {
     };
     let courses_matching_term_ids: Vec<&canvas::Course> = courses
         .iter()
-        .filter(|course_json: &&canvas::Course| term_ids.contains(&course_json.enrollment_term_id))
-        .collect::<Vec<&canvas::Course>>();
+        .filter(|course_json| term_ids.contains(&course_json.enrollment_term_id))
+        .collect();
     if courses_matching_term_ids.is_empty() {
         println!("Could not find any course matching Term ID(s) {term_ids:?}");
         println!("Please try the following ID(s) instead");
