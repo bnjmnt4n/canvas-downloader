@@ -1,14 +1,7 @@
 #![deny(clippy::unwrap_used)]
 
-use anyhow::{Context, Result};
-use canvas::{File, ProcessOptions};
-use chrono::DateTime;
-use clap::Parser;
-use futures::future::ready;
-use futures::{stream, StreamExt, TryStreamExt};
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use reqwest::{header, Response};
 use std::collections::HashMap;
+use std::time::Duration;
 use std::{
     path::{Path, PathBuf},
     sync::{
@@ -16,6 +9,16 @@ use std::{
         Arc,
     },
 };
+
+use anyhow::{Context, Result};
+use chrono::DateTime;
+use clap::Parser;
+use futures::future::ready;
+use futures::{stream, StreamExt, TryStreamExt};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use reqwest::{header, Response};
+
+use canvas::{File, ProcessOptions};
 
 #[derive(Parser)]
 #[command(name = "Canvas Downloader")]
@@ -69,7 +72,11 @@ async fn main() -> Result<()> {
     }
 
     // Prepare GET request options
-    let client = reqwest::Client::new();
+    let client = reqwest::ClientBuilder::new()
+        .http2_keep_alive_interval(Some(Duration::from_secs(2)))
+        .timeout(Duration::from_secs(10))
+        .build()
+        .with_context(|| "Failed to create HTTP client")?;
     let courses_link = format!("{}/api/v1/users/self/favorites/courses", cred.canvas_url);
     let options = Arc::new(ProcessOptions {
         canvas_token: cred.canvas_token.clone(),
@@ -518,8 +525,9 @@ async fn get_pages(link: String, options: &ProcessOptions) -> Vec<Response> {
 }
 
 mod canvas {
-    use serde::{Deserialize, Serialize};
     use std::sync::atomic::AtomicUsize;
+
+    use serde::{Deserialize, Serialize};
     use tokio::sync::Mutex;
 
     #[derive(Clone, Deserialize, Serialize)]
@@ -575,7 +583,6 @@ mod canvas {
         pub filepath: std::path::PathBuf,
     }
 
-    #[derive(Debug)]
     pub struct ProcessOptions {
         // Input parameters
         pub canvas_token: String,
