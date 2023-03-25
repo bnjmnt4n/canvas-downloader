@@ -1,6 +1,9 @@
 #![deny(clippy::unwrap_used)]
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::ops::Add;
 use std::time::Duration;
 use std::{
     path::{Path, PathBuf},
@@ -199,7 +202,7 @@ async fn main() -> Result<()> {
     options.n_active_requests.fetch_add(1, Ordering::AcqRel); // prevent notifying until all spawned
     for canvas_file in files_to_download.iter() {
         fork!(
-            download_or_delete_file,
+            atomic_download_file,
             canvas_file.clone(),
             File,
             options.clone()
@@ -228,18 +231,47 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn download_or_delete_file(file: File, options: Arc<ProcessOptions>) -> Result<()> {
-    download_file(file.clone(), options.clone())
-        .await
-        .with_context(|| {
-            format!(
-                "Error downloading file. Deleting: {:#?}",
-                std::fs::remove_file(&file.filepath)
-            )
-        })
+async fn atomic_download_file(file: File, options: Arc<ProcessOptions>) -> Result<()> {
+    // Create tmp file from hash
+    let mut tmp_path = file.filepath.clone();
+    tmp_path.pop();
+    let mut h = DefaultHasher::new();
+    file.display_name.hash(&mut h);
+    tmp_path.push(&h.finish().to_string().add(".tmp"));
+
+    // Aborted download?
+    if let Err(e) = download_file((&tmp_path, &file), options.clone()).await {
+        if let Err(e) = std::fs::remove_file(&tmp_path) {
+            eprintln!(
+                "Failed to remove temporary file {tmp_path:?} for {}, err={e:#?}",
+                file.display_name
+            );
+        }
+        return Err(e);
+    }
+
+    // Update file time
+    let updated_at = DateTime::parse_from_rfc3339(&file.updated_at)?;
+    let updated_time = filetime::FileTime::from_unix_time(
+        updated_at.timestamp(),
+        updated_at.timestamp_subsec_nanos(),
+    );
+    if let Err(e) = filetime::set_file_mtime(&tmp_path, updated_time) {
+        eprintln!(
+            "Failed to set modified time of {} with updated_at of {}, err={e:#?}",
+            file.display_name, file.updated_at
+        )
+    }
+
+    // Atomically rename file, doesn't change mtime
+    std::fs::rename(&tmp_path, &file.filepath)?;
+    Ok(())
 }
 
-async fn download_file(canvas_file: File, options: Arc<ProcessOptions>) -> Result<()> {
+async fn download_file(
+    (tmp_path, canvas_file): (&PathBuf, &File),
+    options: Arc<ProcessOptions>,
+) -> Result<()> {
     // Get file
     let mut resp = options
         .client
@@ -256,21 +288,8 @@ async fn download_file(canvas_file: File, options: Arc<ProcessOptions>) -> Resul
     }
 
     // Create + Open file
-    let mut file = std::fs::File::create(&canvas_file.filepath)
-        .with_context(|| format!("Unable to create file={:?}", canvas_file.filepath))?;
-
-    // Update file time
-    let updated_at = DateTime::parse_from_rfc3339(&canvas_file.updated_at)?;
-    let updated_time = filetime::FileTime::from_unix_time(
-        updated_at.timestamp(),
-        updated_at.timestamp_subsec_nanos(),
-    );
-    filetime::set_file_mtime(&canvas_file.filepath, updated_time).with_context(|| {
-        format!(
-            "Failed to set modified time of {} with updated_at of {}",
-            canvas_file.display_name, canvas_file.updated_at
-        )
-    })?;
+    let mut file = std::fs::File::create(tmp_path)
+        .with_context(|| format!("Unable to create tmp file for {:?}", canvas_file.filepath))?;
 
     // Progress bar
     let download_size = resp
@@ -288,7 +307,7 @@ async fn download_file(canvas_file: File, options: Arc<ProcessOptions>) -> Resul
         progress_bar.inc(chunk.len() as u64);
         let mut cursor = std::io::Cursor::new(chunk);
         std::io::copy(&mut cursor, &mut file)
-            .unwrap_or_else(|e| panic!("Could not save file {:?}, err={e}", canvas_file.filepath));
+            .with_context(|| format!("Could not write to file {:?}", canvas_file.filepath))?;
     }
 
     progress_bar.finish();
