@@ -10,7 +10,7 @@ use std::{
     },
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Error, Result};
 use chrono::DateTime;
 use clap::Parser;
 use futures::future::ready;
@@ -37,21 +37,24 @@ struct CommandLineOptions {
 macro_rules! fork {
     // Motivation: recursive async functions are unsupported. We avoid this by using a non-async
     // function `f` to tokio::spawn our recursive function. Conveniently, we can wrap our barrier logic in this function
-    ($f:expr, $url:expr, $path:expr, $options:expr) => {{
-        fn f(url: String, path: PathBuf, options: Arc<ProcessOptions>) {
+    ($f:expr, $arg:expr, $T:ty, $options:expr) => {{
+        fn g(arg: $T, options: Arc<ProcessOptions>) {
             options.n_active_requests.fetch_add(1, Ordering::AcqRel);
             tokio::spawn(async move {
                 let _sem = options.sem_requests.acquire().await.unwrap_or_else(|e| {
                     panic!("Please report on GitHub. Unexpected closed sem, err={e}")
                 });
-                $f(url, path, options.clone()).await;
+                let res = $f(arg, options.clone()).await;
                 let new_val = options.n_active_requests.fetch_sub(1, Ordering::AcqRel) - 1;
                 if new_val == 0 {
                     options.notify_main.notify_one();
                 }
+                if let Err(e) = res {
+                    eprintln!("{e:#?}");
+                }
             });
         }
-        f($url, $path, $options);
+        g($arg, $options);
     }};
 }
 
@@ -73,25 +76,40 @@ async fn main() -> Result<()> {
 
     // Prepare GET request options
     let client = reqwest::ClientBuilder::new()
+        .tcp_keepalive(Some(Duration::from_secs(10)))
         .http2_keep_alive_interval(Some(Duration::from_secs(2)))
-        .timeout(Duration::from_secs(10))
         .build()
         .with_context(|| "Failed to create HTTP client")?;
     let courses_link = format!("{}/api/v1/users/self/favorites/courses", cred.canvas_url);
     let options = Arc::new(ProcessOptions {
         canvas_token: cred.canvas_token.clone(),
         client: client.clone(),
+        // Process
         files_to_download: tokio::sync::Mutex::new(Vec::new()),
         download_newer: args.download_newer,
+        // Download
+        progress_bars: MultiProgress::new(),
+        progress_style: {
+            let style_template = if termsize::get().map_or(false, |size| size.cols < 100) {
+                "[{wide_bar:.cyan/blue}] {total_bytes} - {msg}"
+            } else {
+                "[{bar:20.cyan/blue}] {bytes}/{total_bytes} - {bytes_per_sec} - {msg}"
+            };
+            ProgressStyle::default_bar()
+                .template(style_template)
+                .unwrap_or_else(|e| panic!("Please report this issue on GitHub: error with progress bar style={style_template}, err={e}"))
+                .progress_chars("=>-")
+        },
+        // Synchronization
         n_active_requests: AtomicUsize::new(0),
         sem_requests: tokio::sync::Semaphore::new(8), // WARN magic constant.
-        // TODO handle canvas rate limiting errors, maybe scale up if possible
         notify_main: tokio::sync::Notify::new(),
+        // TODO handle canvas rate limiting errors, maybe scale up if possible
     });
 
     // Get courses
     let courses: Vec<canvas::Course> = get_pages(courses_link.clone(), &options)
-        .await
+        .await?
         .into_iter()
         .map(|resp| resp.json::<Vec<serde_json::Value>>()) // resp --> Result<Vec<json>>
         .collect::<stream::FuturesUnordered<_>>() // (in any order)
@@ -147,8 +165,8 @@ async fn main() -> Result<()> {
 
         fork!(
             process_folders,
-            course_folders_link,
-            course_folder_path,
+            (course_folders_link, course_folder_path),
+            (String, PathBuf),
             options.clone()
         );
     }
@@ -163,18 +181,10 @@ async fn main() -> Result<()> {
     // 3. Bounded concurrency: acquire or block on semaphore before request
     // 4. No busy wait: Last task will see that there are 0 active requests and notify main
     options.notify_main.notified().await;
-    // Sanity check: running tasks trying to acquire sem will panic
-    options.sem_requests.close();
     assert_eq!(options.n_active_requests.load(Ordering::Acquire), 0);
     println!();
 
-    // Tokio uses the number of cpus as num of work threads in the default runtime
-    let num_worker_threads = num_cpus::get();
-    let files_to_download = Arc::new(options.files_to_download.lock().await.clone());
-    let num_worker_extra_work = files_to_download.len() % num_worker_threads;
-    let min_work = files_to_download.len() / num_worker_threads;
-    let progress_bars = Arc::new(MultiProgress::new());
-
+    let files_to_download = options.files_to_download.lock().await;
     println!(
         "Downloading {} file{}",
         files_to_download.len(),
@@ -185,141 +195,27 @@ async fn main() -> Result<()> {
         }
     );
 
-    let mut join_handles = Vec::new();
-    let atomic_file_index = Arc::new(AtomicUsize::new(0));
-
-    // We manually limit each worker thread to only deal with 1 file at all time to avoid
-    // spamming http requests
-    for i in 0..num_worker_threads {
-        let mut work = min_work;
-        if i < num_worker_extra_work {
-            work += 1;
-        }
-        let canvas_token = cred.canvas_token.clone();
-        let client = client.clone();
-        let files_to_download = files_to_download.clone();
-        let progress_bars = progress_bars.clone();
-        let atomic_file_index = atomic_file_index.clone();
-        let handle = tokio::spawn(async move {
-            for _ in 0..work {
-                let file_index = atomic_file_index.fetch_add(1, Ordering::AcqRel);
-                let canvas_file = files_to_download.get(file_index).expect(
-                    "Please report this issue on GitHub: downloading file with index out of bounds",
-                );
-
-                // We need to determine the file size before we download, so we can create a ProgressBar
-                // A Header request for the CONTENT_LENGTH header gets us the file size
-                let download_size = {
-                    let resp = client
-                        .head(&canvas_file.url)
-                        .send()
-                        .await
-                        .unwrap_or_else(|e| {
-                            panic!(
-                                "Unable to get file information for {:?}, err={e}",
-                                canvas_file
-                            )
-                        });
-                    if resp.status().is_success() {
-                        resp.headers() // Gives us the HeaderMap
-                            .get(header::CONTENT_LENGTH) // Gives us an Option containing the HeaderValue
-                            .and_then(|ct_len| ct_len.to_str().ok()) // Unwraps the Option as &str
-                            .and_then(|ct_len| ct_len.parse().ok()) // Parses the Option as u64
-                            .unwrap_or(0) // Fallback to 0
-                    } else {
-                        // We return an Error if something goes wrong here
-                        println!("Failed to download {}", canvas_file.display_name);
-                        continue;
-                    }
-                };
-
-                let progress_bar = progress_bars.add(ProgressBar::new(download_size));
-
-                let style_template = if termsize::get().map_or(false, |size| size.cols < 100) {
-                    "[{wide_bar:.cyan/blue}] {total_bytes} - {msg}"
-                } else {
-                    "[{bar:20.cyan/blue}] {bytes}/{total_bytes} - {bytes_per_sec} - {msg}"
-                };
-                progress_bar.set_style(
-                    ProgressStyle::default_bar()
-                        .template(style_template)
-                        .unwrap_or_else(|e| panic!("Please report this issue on GitHub: error with progress bar style={style_template}, err={e}"))
-                        .progress_chars("=>-"),
-                );
-
-                let message = canvas_file.display_name.to_string();
-
-                progress_bar.set_message(message);
-
-                let mut file = std::fs::File::create(&canvas_file.filepath).unwrap_or_else(|e| {
-                    panic!(
-                        "Unable to create file={:?} with err={e}",
-                        canvas_file.filepath
-                    )
-                });
-                // canvas also provides a modified_time of the file but updated_at should be more proper
-                // as it probably represents the upload date of the file which is more apt for determining
-                // if the file was changed since downloading it
-                match DateTime::parse_from_rfc3339(&canvas_file.updated_at) {
-                    Ok(updated_at) => {
-                        if filetime::set_file_mtime(
-                            &canvas_file.filepath,
-                            filetime::FileTime::from_unix_time(
-                                updated_at.timestamp(),
-                                updated_at.timestamp_subsec_nanos(),
-                            ),
-                        )
-                        .is_err()
-                        {
-                            println!(
-                                "Failed to set modified time of {} with updated_at of {}",
-                                canvas_file.display_name, canvas_file.updated_at
-                            );
-                        };
-                    }
-                    Err(_) => {
-                        println!(
-                            "Failed to parse updated_at time for {}, {}",
-                            canvas_file.display_name, canvas_file.updated_at
-                        );
-                        continue;
-                    }
-                };
-
-                let mut file_response = client
-                    .get(&canvas_file.url)
-                    .bearer_auth(&canvas_token)
-                    .send()
-                    .await
-                    .unwrap_or_else(|e| {
-                        panic!(
-                            "Something went wrong when reaching {}, err={e}",
-                            canvas_file.url
-                        )
-                    });
-
-                while let Some(chunk) = file_response.chunk().await.unwrap_or_else(|e| {
-                    panic!(
-                        "Something went wrong downloading {}, err={e}",
-                        canvas_file.url
-                    )
-                }) {
-                    progress_bar.inc(chunk.len() as u64);
-                    let mut cursor = std::io::Cursor::new(chunk);
-                    std::io::copy(&mut cursor, &mut file).unwrap_or_else(|e| {
-                        panic!("Could not save file {:?}, err={e}", canvas_file.filepath)
-                    });
-                }
-                progress_bar.finish();
-            }
-        });
-
-        join_handles.push(handle);
+    // Download files
+    options.n_active_requests.fetch_add(1, Ordering::AcqRel); // prevent notifying until all spawned
+    for canvas_file in files_to_download.iter() {
+        fork!(
+            download_or_delete_file,
+            canvas_file.clone(),
+            File,
+            options.clone()
+        );
     }
 
-    for handle in join_handles {
-        handle.await?;
+    // Wait for downloads
+    let new_val = options.n_active_requests.fetch_sub(1, Ordering::AcqRel) - 1;
+    if new_val == 0 {
+        // notify if all finished immediately
+        options.notify_main.notify_one();
     }
+    options.notify_main.notified().await;
+    // Sanity check: running tasks trying to acquire sem will panic
+    options.sem_requests.close();
+    assert_eq!(options.n_active_requests.load(Ordering::Acquire), 0);
 
     for canvas_file in files_to_download.iter() {
         println!(
@@ -329,6 +225,73 @@ async fn main() -> Result<()> {
         );
     }
 
+    Ok(())
+}
+
+async fn download_or_delete_file(file: File, options: Arc<ProcessOptions>) -> Result<()> {
+    download_file(file.clone(), options.clone())
+        .await
+        .with_context(|| {
+            format!(
+                "Error downloading file. Deleting: {:#?}",
+                std::fs::remove_file(&file.filepath)
+            )
+        })
+}
+
+async fn download_file(canvas_file: File, options: Arc<ProcessOptions>) -> Result<()> {
+    // Get file
+    let mut resp = options
+        .client
+        .head(&canvas_file.url)
+        .bearer_auth(&options.canvas_token)
+        .send()
+        .await
+        .with_context(|| format!("Something went wrong when reaching {}", canvas_file.url))?;
+    if !resp.status().is_success() {
+        return Err(Error::msg(format!(
+            "Failed to download {}, got {resp:#?}",
+            canvas_file.display_name
+        )));
+    }
+
+    // Create + Open file
+    let mut file = std::fs::File::create(&canvas_file.filepath)
+        .with_context(|| format!("Unable to create file={:?}", canvas_file.filepath))?;
+
+    // Update file time
+    let updated_at = DateTime::parse_from_rfc3339(&canvas_file.updated_at)?;
+    let updated_time = filetime::FileTime::from_unix_time(
+        updated_at.timestamp(),
+        updated_at.timestamp_subsec_nanos(),
+    );
+    filetime::set_file_mtime(&canvas_file.filepath, updated_time).with_context(|| {
+        format!(
+            "Failed to set modified time of {} with updated_at of {}",
+            canvas_file.display_name, canvas_file.updated_at
+        )
+    })?;
+
+    // Progress bar
+    let download_size = resp
+        .headers() // Gives us the HeaderMap
+        .get(header::CONTENT_LENGTH) // Gives us an Option containing the HeaderValue
+        .and_then(|ct_len| ct_len.to_str().ok()) // Unwraps the Option as &str
+        .and_then(|ct_len| ct_len.parse().ok()) // Parses the Option as u64
+        .unwrap_or(0); // Fallback to 0
+    let progress_bar = options.progress_bars.add(ProgressBar::new(download_size));
+    progress_bar.set_message(canvas_file.display_name.to_string());
+    progress_bar.set_style(options.progress_style.clone());
+
+    // Download
+    while let Some(chunk) = resp.chunk().await? {
+        progress_bar.inc(chunk.len() as u64);
+        let mut cursor = std::io::Cursor::new(chunk);
+        std::io::copy(&mut cursor, &mut file)
+            .unwrap_or_else(|e| panic!("Could not save file {:?}, err={e}", canvas_file.filepath));
+    }
+
+    progress_bar.finish();
     Ok(())
 }
 
@@ -349,8 +312,11 @@ fn print_all_courses_by_term(courses: &[canvas::Course]) {
 }
 
 // async recursion needs boxing
-async fn process_folders(url: String, path: PathBuf, options: Arc<ProcessOptions>) {
-    let pages = get_pages(url, &options).await;
+async fn process_folders(
+    (url, path): (String, PathBuf),
+    options: Arc<ProcessOptions>,
+) -> Result<()> {
+    let pages = get_pages(url, &options).await?;
 
     // For each page
     for pg in pages {
@@ -371,24 +337,25 @@ async fn process_folders(url: String, path: PathBuf, options: Arc<ProcessOptions
                         path.clone()
                     };
                     if !folder_path.exists() {
-                        std::fs::create_dir(&folder_path).unwrap_or_else(|e| {
-                            panic!(
+                        if let Err(e) = std::fs::create_dir(&folder_path) {
+                            eprintln!(
                                 "Failed to create directory: {}, err={e}",
                                 folder_path.to_string_lossy()
-                            )
-                        });
+                            );
+                            continue;
+                        };
                     }
 
                     fork!(
                         process_files,
-                        folder.files_url,
-                        folder_path.clone(),
+                        (folder.files_url, folder_path.clone()),
+                        (String, PathBuf),
                         options.clone()
                     );
                     fork!(
                         process_folders,
-                        folder.folders_url,
-                        folder_path,
+                        (folder.folders_url, folder_path),
+                        (String, PathBuf),
                         options.clone()
                     );
                 }
@@ -398,7 +365,7 @@ async fn process_folders(url: String, path: PathBuf, options: Arc<ProcessOptions
             Ok(canvas::FolderResult::Err { status }) => {
                 let course_has_no_folders = status == "unauthorized";
                 if !course_has_no_folders {
-                    println!(
+                    eprintln!(
                         "Failed to access folders at link:{uri}, path:{path:?}, status:{status}",
                     );
                 }
@@ -406,14 +373,16 @@ async fn process_folders(url: String, path: PathBuf, options: Arc<ProcessOptions
 
             // Parse error
             Err(e) => {
-                println!("Failed to deserialize folders at link:{uri}, path:{path:?}\n{e:?}",);
+                eprintln!("Failed to deserialize folders at link:{uri}, path:{path:?}\n{e:?}",);
             }
         }
     }
+
+    Ok(())
 }
 
-async fn process_files(url: String, path: PathBuf, options: Arc<ProcessOptions>) {
-    let pages = get_pages(url, &options).await;
+async fn process_files((url, path): (String, PathBuf), options: Arc<ProcessOptions>) -> Result<()> {
+    let pages = get_pages(url, &options).await?;
 
     // For each page
     for pg in pages {
@@ -432,7 +401,7 @@ async fn process_files(url: String, path: PathBuf, options: Arc<ProcessOptions>)
             Ok(canvas::FileResult::Err { status }) => {
                 let course_has_no_files = status == "unauthorized";
                 if !course_has_no_files {
-                    println!(
+                    eprintln!(
                         "Failed to access files at link:{uri}, path:{path:?}, status:{status}",
                     );
                 }
@@ -440,10 +409,12 @@ async fn process_files(url: String, path: PathBuf, options: Arc<ProcessOptions>)
 
             // Parse error
             Err(e) => {
-                println!("Failed to deserialize files at link:{uri}, path:{path:?}\n{e:?}",);
+                eprintln!("Failed to deserialize files at link:{uri}, path:{path:?}\n{e:?}",);
             }
         };
     }
+
+    Ok(())
 }
 
 fn filter_files(options: &ProcessOptions, path: &Path, files: Vec<File>) -> Vec<File> {
@@ -471,12 +442,22 @@ fn filter_files(options: &ProcessOptions, path: &Path, files: Vec<File>) -> Vec<
         })
         .filter(|f| !f.locked_for_user)
         .filter(|f| {
+            if DateTime::parse_from_rfc3339(&f.updated_at).is_ok() {
+                return true;
+            }
+            eprintln!(
+                "Failed to parse updated_at time for {}, {}",
+                f.display_name, f.updated_at
+            );
+            false
+        })
+        .filter(|f| {
             !f.filepath.exists() || (updated(&f.filepath, &f.updated_at) && options.download_newer)
         })
         .collect()
 }
 
-async fn get_pages(link: String, options: &ProcessOptions) -> Vec<Response> {
+async fn get_pages(link: String, options: &ProcessOptions) -> Result<Vec<Response>> {
     fn parse_next_page(resp: &Response) -> Option<String> {
         // Parse LINK header
         let links = resp.headers().get(header::LINK)?.to_str().ok()?; // ok to not have LINK header
@@ -513,15 +494,14 @@ async fn get_pages(link: String, options: &ProcessOptions) -> Vec<Response> {
             .get(&uri)
             .bearer_auth(&options.canvas_token)
             .send()
-            .await
-            .unwrap_or_else(|e| panic!("Something went wrong when reaching {}, err={e}", uri));
+            .await?; // TODO add timeout + retry logic
 
         // Get next page before returning for json
         link = parse_next_page(&resp);
         resps.push(resp);
     }
 
-    resps
+    Ok(resps)
 }
 
 mod canvas {
@@ -584,12 +564,14 @@ mod canvas {
     }
 
     pub struct ProcessOptions {
-        // Input parameters
         pub canvas_token: String,
         pub client: reqwest::Client,
+        // Process
         pub download_newer: bool,
-        // Output
         pub files_to_download: Mutex<Vec<File>>,
+        // Download
+        pub progress_bars: indicatif::MultiProgress,
+        pub progress_style: indicatif::ProgressStyle,
         // Synchronization
         pub n_active_requests: AtomicUsize, // main() waits for this to be 0
         pub sem_requests: tokio::sync::Semaphore, // Limit #active requests

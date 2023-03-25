@@ -23,4 +23,3 @@ tokio = { version = ">=1", features = ["full"] }
 
 [profile.release]
 strip = true
-panic = "abort"
