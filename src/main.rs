@@ -275,7 +275,7 @@ async fn download_file(
     // Get file
     let mut resp = options
         .client
-        .head(&canvas_file.url)
+        .get(&canvas_file.url)
         .bearer_auth(&options.canvas_token)
         .send()
         .await
