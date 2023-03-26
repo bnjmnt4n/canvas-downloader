@@ -124,7 +124,7 @@ async fn main() -> Result<()> {
         .map(serde_json::from_value) // json --> Result<course>
         .try_collect()
         .await
-        .with_context(|| "Failed to deserialize course json")?; // Result<course> --> course
+        .with_context(|| "Error when getting course json")?; // Result<course> --> course
 
     // Filter courses by term IDs
     let Some(term_ids) = args.term_ids else {
@@ -392,7 +392,7 @@ async fn process_folders(
 
             // Parse error
             Err(e) => {
-                eprintln!("Failed to deserialize folders at link:{uri}, path:{path:?}\n{e:?}",);
+                eprintln!("Error when getting folders at link:{uri}, path:{path:?}\n{e:?}",);
             }
         }
     }
@@ -428,7 +428,7 @@ async fn process_files((url, path): (String, PathBuf), options: Arc<ProcessOptio
 
             // Parse error
             Err(e) => {
-                eprintln!("Failed to deserialize files at link:{uri}, path:{path:?}\n{e:?}",);
+                eprintln!("Error when getting files at link:{uri}, path:{path:?}\n{e:?}",);
             }
         };
     }
@@ -512,8 +512,9 @@ async fn get_pages(link: String, options: &ProcessOptions) -> Result<Vec<Respons
             .client
             .get(&uri)
             .bearer_auth(&options.canvas_token)
+            .timeout(Duration::from_secs(10))
             .send()
-            .await?; // TODO add timeout + retry logic
+            .await?;
 
         // Get next page before returning for json
         link = parse_next_page(&resp);
