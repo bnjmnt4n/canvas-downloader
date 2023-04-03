@@ -53,7 +53,7 @@ macro_rules! fork {
                     options.notify_main.notify_one();
                 }
                 if let Err(e) = res {
-                    eprintln!("{e:#?}");
+                    eprintln!("{e:?}");
                 }
             });
         }
@@ -243,7 +243,7 @@ async fn atomic_download_file(file: File, options: Arc<ProcessOptions>) -> Resul
     if let Err(e) = download_file((&tmp_path, &file), options.clone()).await {
         if let Err(e) = std::fs::remove_file(&tmp_path) {
             eprintln!(
-                "Failed to remove temporary file {tmp_path:?} for {}, err={e:#?}",
+                "Failed to remove temporary file {tmp_path:?} for {}, err={e:?}",
                 file.display_name
             );
         }
@@ -258,7 +258,7 @@ async fn atomic_download_file(file: File, options: Arc<ProcessOptions>) -> Resul
     );
     if let Err(e) = filetime::set_file_mtime(&tmp_path, updated_time) {
         eprintln!(
-            "Failed to set modified time of {} with updated_at of {}, err={e:#?}",
+            "Failed to set modified time of {} with updated_at of {}, err={e:?}",
             file.display_name, file.updated_at
         )
     }
@@ -282,7 +282,7 @@ async fn download_file(
         .with_context(|| format!("Something went wrong when reaching {}", canvas_file.url))?;
     if !resp.status().is_success() {
         return Err(Error::msg(format!(
-            "Failed to download {}, got {resp:#?}",
+            "Failed to download {}, got {resp:?}",
             canvas_file.display_name
         )));
     }
