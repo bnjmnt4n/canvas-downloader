@@ -15,13 +15,16 @@ use std::{
 };
 
 use anyhow::{Context, Error, Result};
-use chrono::DateTime;
+use chrono::{DateTime, Local};
 use clap::Parser;
-use futures::future::ready;
+use futures::future::{ready, join_all};
 use futures::{stream, StreamExt, TryStreamExt};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rand::Rng;
+use regex::Regex;
 use reqwest::{header, Response, Url};
+use select::document::Document;
+use select::predicate::Name;
 
 use canvas::{File, ProcessOptions};
 
@@ -88,6 +91,7 @@ async fn main() -> Result<()> {
     let courses_link = format!("{}/api/v1/users/self/favorites/courses", cred.canvas_url);
     let options = Arc::new(ProcessOptions {
         canvas_token: cred.canvas_token.clone(),
+        canvas_url: cred.canvas_url.clone(),
         client: client.clone(),
         // Process
         files_to_download: tokio::sync::Mutex::new(Vec::new()),
@@ -535,6 +539,13 @@ async fn process_page_body(
             page_html_file
                 .write_all(page_html.as_bytes())
                 .with_context(|| format!("Could not write to file {:?}", page_html_path))?;
+            
+            fork!(
+                process_html_links,
+                (page_html, path),
+                (String, PathBuf),
+                options.clone()
+            )
         }
         Result::Err(e) => {
             eprintln!("Error when parsing page body at link:{url}, path:{page_file_path:?}\n{e:?}",);
@@ -606,6 +617,12 @@ async fn process_discussions(
                         lock.append(&mut filtered_files);
                     }
                     
+                    fork!(
+                        process_html_links,
+                        (discussion.message, discussion_path.clone()),
+                        (String, PathBuf),
+                        options.clone()
+                    );
                     let view_url = format!("{}discussion_topics/{}/view", url, discussion.id);
                     fork!(
                         process_discussion_view,
@@ -648,12 +665,20 @@ async fn process_discussion_view(
     match discussion_view_result {
         Result::Ok(discussion_view) => {
             for view in discussion_view.view {
+                if let Some(message) = view.message {
+                    fork!(
+                        process_html_links,
+                        (message, path.clone()),
+                        (String, PathBuf),
+                        options.clone()
+                    )
+                }
                 if let Some(mut attachments) = view.attachments {
                     attachments_all.append(&mut attachments);
-                };
+                }
                 if let Some(attachment) = view.attachment {
                     attachments_all.push(attachment);
-                };
+                }
             }
         }
         Result::Err(e) => {
@@ -749,6 +774,125 @@ fn filter_files(options: &ProcessOptions, path: &Path, files: Vec<File>) -> Vec<
             !f.filepath.exists() || (updated(&f.filepath, &f.updated_at) && options.download_newer)
         })
         .collect()
+}
+
+async fn process_html_links(
+    (html, path): (String, PathBuf),
+    options: Arc<ProcessOptions>,
+) -> Result<()> {
+
+    // If file link is part of course files
+    let re = Regex::new(r"/courses/[0-9]+/files/[0-9]+").unwrap();
+    let file_links = Document::from(html.as_str())
+        .find(Name("a"))
+        .filter_map(|n| n.attr("href"))
+        .filter(|x| x.starts_with(&options.canvas_url))
+        .map(|x| Url::parse(x))
+        .filter(|x| x.is_ok())
+        .map(|x| x.unwrap())
+        .filter(|x| re.is_match(x.path()))
+        .map(|x| format!("{}/api/v1{}", options.canvas_url, x.path()))
+        .collect::<Vec<String>>();
+    
+    let mut link_files = join_all(file_links.into_iter()
+        .map(|x| process_file_id((x, path.clone()), options.clone())))
+        .await
+        .into_iter()
+        .filter_map(|x| x.ok())
+        .collect::<Vec<File>>();
+
+    // If image is from canvas it is likely the file url gives permission denied, so download from the CDN
+    let image_links = Document::from(html.as_str())
+        .find(Name("img"))
+        .filter_map(|n| n.attr("src"))
+        .filter(|x| x.starts_with(&options.canvas_url))
+        .filter(|x| !x.contains("equation_images"))
+        .map(|x| x.to_string())
+        .collect::<Vec<String>>();
+    
+    link_files.append(join_all(image_links.into_iter()
+        .map(|x| prepare_link_for_download((x, path.clone()), options.clone())))
+        .await
+        .into_iter()
+        .filter_map(|x| x.ok())
+        .collect::<Vec<File>>().as_mut());
+
+    let mut filtered_files = filter_files(&options, &path, link_files);
+    let mut lock = options.files_to_download.lock().await;
+    lock.append(&mut filtered_files);
+
+    Ok(())
+}
+
+async fn process_file_id(
+    (url, path): (String, PathBuf),
+    options: Arc<ProcessOptions>,
+) -> Result<File> {
+    let file_resp = get_canvas_api(url.clone(), &options).await?;
+    let file_result = file_resp.json::<canvas::File>().await;
+    match file_result {
+        Result::Ok(mut file) => {
+            let file_path = path.join(&file.display_name);
+            file.filepath = file_path;
+            return Ok(file);
+        }
+        Err(e) => {
+            eprintln!("Error when getting file info at link:{url}, path:{path:?}\n{e:?}",);
+            return Err(Into::into(e));
+        }
+    }
+}
+async fn prepare_link_for_download(
+    (link, path): (String, PathBuf),
+    options: Arc<ProcessOptions>,
+) -> Result<File> {
+
+    let resp = options
+        .client
+        .head(&link)
+        .bearer_auth(&options.canvas_token)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await?;
+    let headers = resp.headers();
+    // get filename out of Content-Disposition header
+    let filename = headers
+        .get(header::CONTENT_DISPOSITION)
+        .and_then(|x| x.to_str().ok())
+        .and_then(|x| {
+            let re = Regex::new(r#"filename="(.*)""#).unwrap();
+            re.captures(x)
+        })
+        .and_then(|x| x.get(1))
+        .map(|x| x.as_str())
+        .unwrap_or_else(|| {
+            let re = Regex::new(r"/([^/]+)$").unwrap();
+            re.captures(&link)
+                .and_then(|x| x.get(1))
+                .map(|x| x.as_str())
+                .unwrap_or("unknown")
+        });
+    // last-modified header to TZ string
+    let updated_at = headers
+        .get(header::LAST_MODIFIED)
+        .and_then(|x| x.to_str().ok())
+        .and_then(|x| {
+            let dt = DateTime::parse_from_rfc2822(x).ok()?;
+            Some(dt.with_timezone(&Local).to_rfc3339())
+        })
+        .unwrap_or_else(|| Local::now().to_rfc3339());
+    
+    let file = File {
+        id: 0,
+        folder_id: 0,
+        display_name: filename.to_string(),
+        size: 0,
+        url: link.clone(),
+        updated_at: updated_at,
+        locked_for_user: false,
+        filepath: path.join(filename),
+    };
+    Ok(file)
 }
 
 async fn get_pages(link: String, options: &ProcessOptions) -> Result<Vec<Response>> {
@@ -941,6 +1085,7 @@ mod canvas {
 
     pub struct ProcessOptions {
         pub canvas_token: String,
+        pub canvas_url: String,
         pub client: reqwest::Client,
         // Process
         pub download_newer: bool,
