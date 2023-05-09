@@ -446,6 +446,100 @@ async fn process_data(
         (String, bool, PathBuf),
         options.clone()
     );
+    let pages_path = path.join("pages");
+    create_folder_if_not_exist(&pages_path)?;
+    fork!(
+        process_pages,
+        (url.clone(), pages_path),
+        (String, PathBuf),
+        options.clone()
+    );
+    Ok(())
+}
+
+async fn process_pages(
+    (url, path): (String, PathBuf),
+    options: Arc<ProcessOptions>,
+) -> Result<()> {
+    let pages_url = format!("{}pages", url);
+    let pages = get_pages(pages_url, &options).await?;
+    
+    let pages_path = path.join("pages.json");
+    let mut pages_file = std::fs::File::create(pages_path.clone())
+        .with_context(|| format!("Unable to create file for {:?}", pages_path))?;
+
+    for pg in pages {
+        let uri = pg.url().to_string();
+        let page_body = pg.text().await?;
+
+        pages_file
+            .write_all(page_body.as_bytes())
+            .with_context(|| format!("Could not write to file {:?}", pages_path))?;
+
+        let page_result = serde_json::from_str::<canvas::PageResult>(&page_body);
+
+        match page_result {
+            Ok(canvas::PageResult::Ok(pages)) => {
+                for page in pages {
+                    let page_url = format!("{}pages/{}", url, page.url);
+                    let page_file_path = path.join(page.url.clone());
+                    create_folder_if_not_exist(&page_file_path)?;
+                    fork!(
+                        process_page_body,
+                        (page_url, page.url, page_file_path),
+                        (String, String, PathBuf),
+                        options.clone()
+                    )
+                }
+            }
+
+            Ok(canvas::PageResult::Err { status }) => {
+                eprintln!("No pages found for url {} status: {}", uri, status);
+            }
+
+            Err(e) => {
+                eprintln!("No pages found for url {} error: {}", uri, e);
+            }
+        };
+    }
+
+    Ok(())
+}
+
+async fn process_page_body(
+    (url, title, path): (String, String, PathBuf),
+    options: Arc<ProcessOptions>,
+) -> Result<()> {
+    let page_resp = get_canvas_api(url.clone(), &options).await?;
+
+    let page_file_path = path.join(format!("{}.json", title));
+    let mut page_file = std::fs::File::create(page_file_path.clone())
+        .with_context(|| format!("Unable to create file for {:?}", page_file_path))?;
+
+    let page_resp_text = page_resp.text().await?;
+    page_file
+        .write_all(page_resp_text.as_bytes())
+        .with_context(|| format!("Could not write to file {:?}", page_file_path))?;
+
+    let page_body_result = serde_json::from_str::<canvas::PageBody>(&page_resp_text);
+    match page_body_result {
+        Result::Ok(page_body) => {
+            let page_html = format!(
+                "<html><head><title>{}</title></head><body>{}</body></html>",
+                page_body.title, page_body.body);
+            
+            let page_html_path = path.join(format!("{}.html", page_body.url));
+            let mut page_html_file = std::fs::File::create(page_html_path.clone())
+                .with_context(|| format!("Unable to create file for {:?}", page_html_path))?;
+
+            page_html_file
+                .write_all(page_html.as_bytes())
+                .with_context(|| format!("Could not write to file {:?}", page_html_path))?;
+        }
+        Result::Err(e) => {
+            eprintln!("Error when parsing page body at link:{url}, path:{page_file_path:?}\n{e:?}",);
+        }
+    }
     Ok(())
 }
 
@@ -776,6 +870,32 @@ mod canvas {
     pub(crate) enum FileResult {
         Err { status: String },
         Ok(Vec<File>),
+    }
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    pub(crate) enum PageResult {
+        Err { status: String },
+        Ok(Vec<Page>),
+    }
+
+    #[derive(Clone, Debug, Deserialize)]
+    pub struct Page {
+        pub page_id: u32,
+        pub url: String,
+        pub title: String,
+        pub updated_at: String,
+        pub locked_for_user: bool,
+    }
+
+    #[derive(Clone, Debug, Deserialize)]
+    pub struct PageBody {
+        pub page_id: u32,
+        pub url: String,
+        pub title: String,
+        pub body: String,
+        pub updated_at: String,
+        pub locked_for_user: bool,
     }
 
     #[derive(Deserialize)]
