@@ -88,11 +88,21 @@ async fn main() -> Result<()> {
         .http2_keep_alive_interval(Some(Duration::from_secs(2)))
         .build()
         .with_context(|| "Failed to create HTTP client")?;
+    let user_link = format!("{}/api/v1/users/self", cred.canvas_url);
+    let user = client
+        .get(&user_link)
+        .bearer_auth(&cred.canvas_token)
+        .send()
+        .await?
+        .json::<canvas::User>()
+        .await
+        .with_context(|| "Failed to get user info")?;
     let courses_link = format!("{}/api/v1/users/self/favorites/courses", cred.canvas_url);
     let options = Arc::new(ProcessOptions {
         canvas_token: cred.canvas_token.clone(),
         canvas_url: cred.canvas_url.clone(),
         client: client.clone(),
+        user: user.clone(),
         // Process
         files_to_download: tokio::sync::Mutex::new(Vec::new()),
         download_newer: args.download_newer,
@@ -427,6 +437,14 @@ async fn process_data(
     (url, path): (String, PathBuf),
     options: Arc<ProcessOptions>,
 ) -> Result<()> {
+    let assignments_path = path.join("assignments");
+    create_folder_if_not_exist(&assignments_path)?;
+    fork!(
+        process_assignments,
+        (url.clone(), assignments_path),
+        (String, PathBuf),
+        options.clone()
+    );
     let users_path = path.join("users.json");
     fork!(
         process_users,
@@ -549,6 +567,90 @@ async fn process_page_body(
         }
         Result::Err(e) => {
             eprintln!("Error when parsing page body at link:{url}, path:{page_file_path:?}\n{e:?}",);
+        }
+    }
+    Ok(())
+}
+
+async fn process_assignments(
+    (url, path): (String, PathBuf),
+    options: Arc<ProcessOptions>,
+) -> Result<()> {
+    let assignments_url = format!("{}assignments?include[]=submission&include[]=assignment_visibility&include[]=all_dates&include[]=overrides&include[]=observed_users&include[]=can_edit&include[]=score_statistics", url);
+    let pages = get_pages(assignments_url, &options).await?;
+    
+    let assignments_json = path.join("assignments.json");
+    let mut assignments_file = std::fs::File::create(assignments_json.clone())
+        .with_context(|| format!("Unable to create file for {:?}", assignments_json))?;
+
+    for pg in pages {
+        let uri = pg.url().to_string();
+        let page_body = pg.text().await?;
+
+        assignments_file
+            .write_all(page_body.as_bytes())
+            .with_context(|| format!("Unable to write to file for {:?}", assignments_json))?;
+
+        let assignment_result = serde_json::from_str::<canvas::AssignmentResult>(&page_body);
+
+        match assignment_result {
+            Ok(canvas::AssignmentResult::Ok(assignments)) => {
+                for assignment in assignments {
+                    let assignment_path = path.join(assignment.name);
+                    create_folder_if_not_exist(&assignment_path)?;
+                    let submissions_url = format!("{}assignments/{}/submissions/", url, assignment.id);
+                    fork!(
+                        process_submissions,
+                        (submissions_url, assignment_path.clone()),
+                        (String, PathBuf),
+                        options.clone()
+                    );
+                    fork!(
+                        process_html_links,
+                        (assignment.description, assignment_path),
+                        (String, PathBuf),
+                        options.clone()
+                    );
+                }
+            }
+            Ok(canvas::AssignmentResult::Err { status }) => {
+                eprintln!(
+                    "Failed to access assignments at link:{uri}, path:{path:?}, status:{status}",
+                );
+            }
+            Err(e) => {
+                eprintln!("Error when getting assignments at link:{uri}, path:{path:?}\n{e:?}",);
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn process_submissions(
+    (url, path): (String, PathBuf),
+    options: Arc<ProcessOptions>,
+) -> Result<()> {
+    let submissions_url = format!("{}{}", url, options.user.id);
+
+    let resp = get_canvas_api(submissions_url, &options).await?;
+    let submissions_body = resp.text().await?;
+    let submissions_json = path.join("submission.json");
+    let mut submissions_file = std::fs::File::create(submissions_json.clone())
+        .with_context(|| format!("Unable to create file for {:?}", submissions_json))?;
+
+    submissions_file
+        .write_all(submissions_body.as_bytes())
+        .with_context(|| format!("Unable to write to file for {:?}", submissions_json))?;
+
+    let submissions_result = serde_json::from_str::<canvas::Submission>(&submissions_body);
+    match submissions_result {
+        Result::Ok(submissions) => {
+            let mut filtered_files = filter_files(&options, &path, submissions.attachments);
+            let mut lock = options.files_to_download.lock().await;
+            lock.append(&mut filtered_files);
+        }
+        Result::Err(e) => {
+            eprintln!("Error when getting submissions at link:{url}, path:{path:?}\n{e:?}",);
         }
     }
     Ok(())
@@ -991,6 +1093,12 @@ mod canvas {
         pub enrollment_term_id: u32,
     }
 
+    #[derive(Clone, Debug, Deserialize)]
+    pub struct User {
+        pub id: u32,
+        pub name: String,
+    }
+
     #[derive(Deserialize)]
     #[serde(untagged)]
     pub(crate) enum FolderResult {
@@ -1044,6 +1152,26 @@ mod canvas {
 
     #[derive(Deserialize)]
     #[serde(untagged)]
+    pub(crate) enum AssignmentResult {
+        Err { status: String },
+        Ok(Vec<Assignment>),
+    }
+    #[derive(Clone, Debug, Deserialize)]
+    pub struct Assignment {
+        pub id: u32,
+        pub name: String,
+        pub description: String,
+    }
+
+    #[derive(Clone, Debug, Deserialize)]
+    pub struct Submission {
+        pub id: u32,
+        pub body: Option<String>,
+        pub attachments: Vec<File>,
+    }
+    
+    #[derive(Deserialize)]
+    #[serde(untagged)]
     pub(crate) enum DiscussionResult {
         Err { status: String },
         Ok(Vec<Discussion>),
@@ -1087,6 +1215,7 @@ mod canvas {
         pub canvas_token: String,
         pub canvas_url: String,
         pub client: reqwest::Client,
+        pub user: User,
         // Process
         pub download_newer: bool,
         pub files_to_download: Mutex<Vec<File>>,
