@@ -19,7 +19,8 @@ use clap::Parser;
 use futures::future::ready;
 use futures::{stream, StreamExt, TryStreamExt};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use reqwest::{header, Response};
+use rand::Rng;
+use reqwest::{header, Response, Url};
 
 use canvas::{File, ProcessOptions};
 
@@ -508,13 +509,7 @@ async fn get_pages(link: String, options: &ProcessOptions) -> Result<Vec<Respons
 
     while let Some(uri) = link {
         // GET request
-        let resp = options
-            .client
-            .get(&uri)
-            .bearer_auth(&options.canvas_token)
-            .timeout(Duration::from_secs(10))
-            .send()
-            .await?;
+        let resp = get_canvas_api(uri, options).await?;
 
         // Get next page before returning for json
         link = parse_next_page(&resp);
@@ -522,6 +517,39 @@ async fn get_pages(link: String, options: &ProcessOptions) -> Result<Vec<Respons
     }
 
     Ok(resps)
+}
+
+async fn get_canvas_api(url: String, options: &ProcessOptions) -> Result<Response> {
+    let mut query_pairs : Vec<(String, String)> = Vec::new();
+    // insert into query_pairs from url.query_pairs();
+    for (key, value) in Url::parse(&url)?.query_pairs() {
+        query_pairs.push((key.to_string(), value.to_string()));
+    }
+    for retry in 0..3 {
+        let resp = options
+            .client
+            .get(&url)
+            .query(&query_pairs)
+            .bearer_auth(&options.canvas_token)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await;
+
+        match resp {
+            Ok(resp) => {
+                if resp.status() != reqwest::StatusCode::FORBIDDEN || retry == 2 {
+                    return Ok(resp)
+                }
+            },
+            Err(e) => {println!("Canvas request error uri: {} {}", url, e); return Err(e.into())},
+        }
+
+        let wait_time = Duration::from_millis(rand::thread_rng().gen_range(0..1000 * 2_u64.pow(retry)));
+        println!("Got 403 for {}, waiting {:?} before retrying, retry {}", url, wait_time, retry);
+        tokio::time::sleep(wait_time).await;
+        
+    }
+    Err(Error::msg("canvas request failed"))
 }
 
 mod canvas {
