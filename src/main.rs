@@ -84,7 +84,7 @@ async fn main() -> Result<()> {
         .http2_keep_alive_interval(Some(Duration::from_secs(2)))
         .build()
         .with_context(|| "Failed to create HTTP client")?;
-    let courses_link = format!("{}/api/v1/users/self/favorites/courses", cred.canvas_url);
+    let courses_link = format!("{}/api/v1/courses", cred.canvas_url);
     let options = Arc::new(ProcessOptions {
         canvas_token: cred.canvas_token.clone(),
         client: client.clone(),
