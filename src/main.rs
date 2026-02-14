@@ -3,6 +3,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::io::Write;
 use std::ops::Add;
 use std::time::Duration;
 use std::{
@@ -152,27 +153,32 @@ async fn main() -> Result<()> {
         let course_folder_path = args
             .destination_folder
             .join(course.course_code.replace('/', "_"));
-        if !course_folder_path.exists() {
-            std::fs::create_dir(&course_folder_path).with_context(|| {
-                format!(
-                    "Failed to create directory: {}",
-                    course_folder_path.to_string_lossy()
-                )
-            })?;
-        }
-
+        create_folder_if_not_exist(&course_folder_path)?;
         // Prep URL for course's root folder
         let course_folders_link = format!(
             "{}/api/v1/courses/{}/folders/by_path/",
             cred.canvas_url, course.id
         );
 
+        let folder_path = course_folder_path.join("files");
         fork!(
             process_folders,
-            (course_folders_link, course_folder_path),
+            (course_folders_link, folder_path),
             (String, PathBuf),
             options.clone()
         );
+
+        let course_api_link = format!(
+            "{}/api/v1/courses/{}",
+            cred.canvas_url, course.id
+        );
+        fork!(
+            process_data,
+            (course_api_link, course_folder_path),
+            (String, PathBuf),
+            options.clone()
+        );
+        
     }
 
     // Invariants
@@ -331,6 +337,18 @@ fn print_all_courses_by_term(courses: &[canvas::Course]) {
     }
 }
 
+fn create_folder_if_not_exist(folder_path: &PathBuf) -> Result<()> {
+    if !folder_path.exists() {
+        std::fs::create_dir(&folder_path).with_context(|| {
+            format!(
+                "Failed to create directory: {}",
+                folder_path.to_string_lossy()
+            )
+        })?;
+    }
+    Ok(())
+}
+
 // async recursion needs boxing
 async fn process_folders(
     (url, path): (String, PathBuf),
@@ -396,6 +414,42 @@ async fn process_folders(
                 eprintln!("Error when getting folders at link:{uri}, path:{path:?}\n{e:?}",);
             }
         }
+    }
+
+    Ok(())
+}
+
+async fn process_data(
+    (url, path): (String, PathBuf),
+    options: Arc<ProcessOptions>,
+) -> Result<()> {
+    let users_path = path.join("users.json");
+    fork!(
+        process_users,
+        (url.clone(), users_path),
+        (String, PathBuf),
+        options.clone()
+    );
+    Ok(())
+}
+
+async fn process_users (
+    (url, path): (String, PathBuf),
+    options: Arc<ProcessOptions>,
+) -> Result<()> {
+    let users_url = format!("{}users?include_inactive=true&include[]=avatar_url&include[]=enrollments&include[]=email&include[]=observed_users&include[]=can_be_removed&include[]=custom_links", url);
+    let pages = get_pages(users_url, &options).await?;
+    
+    let users_path = path.to_string_lossy();
+    let mut users_file = std::fs::File::create(path.clone())
+        .with_context(|| format!("Unable to create file for {:?}", users_path))?;
+
+    for pg in pages {
+        let page_body = pg.text().await?;
+        
+        users_file
+            .write_all(page_body.as_bytes())
+            .with_context(|| format!("Unable to write to file for {:?}", users_path))?;
     }
 
     Ok(())
