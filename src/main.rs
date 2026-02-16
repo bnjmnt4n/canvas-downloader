@@ -3,6 +3,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::io::Write;
 use std::ops::Add;
 use std::time::Duration;
 use std::{
@@ -152,27 +153,32 @@ async fn main() -> Result<()> {
         let course_folder_path = args
             .destination_folder
             .join(course.course_code.replace('/', "_"));
-        if !course_folder_path.exists() {
-            std::fs::create_dir(&course_folder_path).with_context(|| {
-                format!(
-                    "Failed to create directory: {}",
-                    course_folder_path.to_string_lossy()
-                )
-            })?;
-        }
-
+        create_folder_if_not_exist(&course_folder_path)?;
         // Prep URL for course's root folder
         let course_folders_link = format!(
             "{}/api/v1/courses/{}/folders/by_path/",
             cred.canvas_url, course.id
         );
 
+        let folder_path = course_folder_path.join("files");
         fork!(
             process_folders,
-            (course_folders_link, course_folder_path),
+            (course_folders_link, folder_path),
             (String, PathBuf),
             options.clone()
         );
+
+        let course_api_link = format!(
+            "{}/api/v1/courses/{}",
+            cred.canvas_url, course.id
+        );
+        fork!(
+            process_data,
+            (course_api_link, course_folder_path),
+            (String, PathBuf),
+            options.clone()
+        );
+        
     }
 
     // Invariants
@@ -331,6 +337,18 @@ fn print_all_courses_by_term(courses: &[canvas::Course]) {
     }
 }
 
+fn create_folder_if_not_exist(folder_path: &PathBuf) -> Result<()> {
+    if !folder_path.exists() {
+        std::fs::create_dir(&folder_path).with_context(|| {
+            format!(
+                "Failed to create directory: {}",
+                folder_path.to_string_lossy()
+            )
+        })?;
+    }
+    Ok(())
+}
+
 // async recursion needs boxing
 async fn process_folders(
     (url, path): (String, PathBuf),
@@ -397,6 +415,168 @@ async fn process_folders(
             }
         }
     }
+
+    Ok(())
+}
+
+async fn process_data(
+    (url, path): (String, PathBuf),
+    options: Arc<ProcessOptions>,
+) -> Result<()> {
+    let users_path = path.join("users.json");
+    fork!(
+        process_users,
+        (url.clone(), users_path),
+        (String, PathBuf),
+        options.clone()
+    );
+    let discussions_path = path.join("discussions");
+    create_folder_if_not_exist(&discussions_path)?;
+    fork!(
+        process_discussions,
+        (url.clone(), false, discussions_path),
+        (String, bool, PathBuf),
+        options.clone()
+    );
+    let announcements_path = path.join("announcements");
+    create_folder_if_not_exist(&announcements_path)?;
+    fork!(
+        process_discussions,
+        (url.clone(), true, announcements_path),
+        (String, bool, PathBuf),
+        options.clone()
+    );
+    Ok(())
+}
+
+async fn process_users (
+    (url, path): (String, PathBuf),
+    options: Arc<ProcessOptions>,
+) -> Result<()> {
+    let users_url = format!("{}users?include_inactive=true&include[]=avatar_url&include[]=enrollments&include[]=email&include[]=observed_users&include[]=can_be_removed&include[]=custom_links", url);
+    let pages = get_pages(users_url, &options).await?;
+    
+    let users_path = path.to_string_lossy();
+    let mut users_file = std::fs::File::create(path.clone())
+        .with_context(|| format!("Unable to create file for {:?}", users_path))?;
+
+    for pg in pages {
+        let page_body = pg.text().await?;
+        
+        users_file
+            .write_all(page_body.as_bytes())
+            .with_context(|| format!("Unable to write to file for {:?}", users_path))?;
+    }
+
+    Ok(())
+}
+
+async fn process_discussions(
+    (url, announcement, path): (String, bool, PathBuf),
+    options: Arc<ProcessOptions>,
+) -> Result<()> {
+    let discussion_url = format!("{}discussion_topics{}", url, if announcement { "?only_announcements=true" } else { "" });
+    let pages = get_pages(discussion_url, &options).await?;
+
+    let discussion_path = path.join("discussions.json");
+    let mut discussion_file = std::fs::File::create(discussion_path.clone())
+        .with_context(|| format!("Unable to create file for {:?}", discussion_path))?;
+
+    for pg in pages {
+        let uri = pg.url().to_string();
+        let page_body = pg.text().await?;
+
+        discussion_file
+            .write_all(page_body.as_bytes())
+            .with_context(|| format!("Unable to write to file for {:?}", discussion_path))?;
+
+        let discussion_result = serde_json::from_str::<canvas::DiscussionResult>(&page_body);
+
+        match discussion_result {
+            Ok(canvas::DiscussionResult::Ok(discussions)) => {
+                for discussion in discussions {
+                    // download attachments
+                    let discussion_path = path.join(format!("{}_{}", discussion.id, sanitize_filename::sanitize(discussion.title)));
+                    create_folder_if_not_exist(&discussion_path)?;
+
+                    let files = discussion.attachments
+                        .into_iter()
+                        .map(|mut f| {
+                            f.display_name = format!("{}_{}", f.id, &f.display_name);
+                            f
+                        })
+                        .collect();
+                    {
+                        let mut filtered_files = filter_files(&options, &path, files);
+                        let mut lock = options.files_to_download.lock().await;
+                        lock.append(&mut filtered_files);
+                    }
+                    
+                    let view_url = format!("{}discussion_topics/{}/view", url, discussion.id);
+                    fork!(
+                        process_discussion_view,
+                        (view_url, discussion_path),
+                        (String, PathBuf),
+                        options.clone()
+                    )
+                }
+            }
+            Ok(canvas::DiscussionResult::Err { status }) => {
+                eprintln!(
+                    "Failed to access discussions at link:{uri}, path:{path:?}, status:{status}",
+                );
+            }
+            Err(e) => {
+                eprintln!("Error when getting discussions at link:{uri}, path:{path:?}\n{e:?}",);
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn process_discussion_view(
+    (url, path): (String, PathBuf),
+    options: Arc<ProcessOptions>,
+) -> Result<()> {
+    let resp = get_canvas_api(url.clone(), &options).await?;
+    let discussion_view_body = resp.text().await?;
+    
+    let discussion_view_json = path.join("discussion.json");
+    let mut discussion_view_file = std::fs::File::create(discussion_view_json.clone())
+        .with_context(|| format!("Unable to create file for {:?}", discussion_view_json))?;
+
+    discussion_view_file
+        .write_all(discussion_view_body.as_bytes())
+        .with_context(|| format!("Unable to write to file for {:?}", discussion_view_json))?;
+
+    let discussion_view_result = serde_json::from_str::<canvas::DiscussionView>(&discussion_view_body);
+    let mut attachments_all = Vec::new();
+    match discussion_view_result {
+        Result::Ok(discussion_view) => {
+            for view in discussion_view.view {
+                if let Some(mut attachments) = view.attachments {
+                    attachments_all.append(&mut attachments);
+                };
+                if let Some(attachment) = view.attachment {
+                    attachments_all.push(attachment);
+                };
+            }
+        }
+        Result::Err(e) => {
+            eprintln!("Error when getting submissions at link:{url}, path:{path:?}\n{e:?}",);
+        }
+    }
+
+    let files = attachments_all
+        .into_iter()
+        .map(|mut f| {
+            f.display_name = format!("{}_{}", f.id, &f.display_name);
+            f
+        })
+        .collect();
+    let mut filtered_files = filter_files(&options, &path, files);
+    let mut lock = options.files_to_download.lock().await;
+    lock.append(&mut filtered_files);
 
     Ok(())
 }
@@ -596,6 +776,34 @@ mod canvas {
     pub(crate) enum FileResult {
         Err { status: String },
         Ok(Vec<File>),
+    }
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    pub(crate) enum DiscussionResult {
+        Err { status: String },
+        Ok(Vec<Discussion>),
+    }
+    #[derive(Clone, Debug, Deserialize)]
+    pub struct Discussion {
+        pub id: u32,
+        pub title: String,
+        pub message: String,
+        pub attachments: Vec<File>,
+    }
+
+    #[derive(Clone, Debug, Deserialize)]
+    pub struct DiscussionView {
+        pub unread_entries: Vec<u32>,
+        pub view: Vec<Comments>,
+    }
+
+    #[derive(Clone, Debug, Deserialize)]
+    pub struct Comments {
+        pub id: u32,
+        pub message: Option<String>,
+        pub attachment: Option<File>,
+        pub attachments: Option<Vec<File>>,
     }
 
     #[derive(Clone, Debug, Deserialize)]
